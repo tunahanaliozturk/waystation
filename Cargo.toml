@@ -1,11 +1,11 @@
 [package]
-name = "menzil"
+name = "waystation"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 description = "An HTTP reverse proxy and load balancer with hot reload, built on tokio, hyper and rustls"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tunahanaliozturk/menzil"
+repository = "https://github.com/tunahanaliozturk/waystation"
 readme = "README.md"
 keywords = ["proxy", "reverse-proxy", "load-balancer", "http", "http2"]
 categories = ["network-programming", "web-programming::http-server"]

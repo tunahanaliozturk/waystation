@@ -20,6 +20,6 @@ Level 2. hyper 1.x for HTTP/1.1 and HTTP/2, tokio for the runtime, rustls for TL
 
 - The parts the project wants to show are its own code, with its own tests.
 - HTTP parsing and HTTP/2 framing come from hyper, which is widely deployed and fuzzed. Writing those again would add months and mostly produce bugs that are already fixed there.
-- Smuggling defence depends partly on how hyper parses. menzil adds its own checks on the parsed head and tests the combined behaviour with raw bytes on a socket, so a change in hyper that loosens parsing is caught by the suite.
+- Smuggling defence depends partly on how hyper parses. waystation adds its own checks on the parsed head and tests the combined behaviour with raw bytes on a socket, so a change in hyper that loosens parsing is caught by the suite.
 - The upstream connection pool is written here, not taken from hyper-util's legacy client, because the pool has to know about health state, draining and reload.
-- No custom protocol work means no way to beat a hand-tuned C proxy on parsing speed. The benchmarks report where menzil stands against nginx and Envoy either way.
+- No custom protocol work means no way to beat a hand-tuned C proxy on parsing speed. The benchmarks report where waystation stands against nginx and Envoy either way.

@@ -1,8 +1,8 @@
-# menzil
+# waystation
 
 An HTTP reverse proxy and load balancer for Rust, built on tokio, hyper and rustls.
 
-A *menzil* was a relay station on the Ottoman post roads: a courier arrived, changed horses and the message went on. A proxy does the same with requests.
+A way station is a stop on a route where a courier changes horses and the message goes on. A proxy is that stop for requests.
 
 ## Status
 

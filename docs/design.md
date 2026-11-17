@@ -1,4 +1,4 @@
-# menzil design
+# waystation design
 
 This document is the contract. Code that disagrees with it is a bug in one of the two, and the fix says which.
 
@@ -28,7 +28,7 @@ listener ─> TLS (rustls) ─> HTTP/1.1 or HTTP/2 (hyper) ─> router ─> filt
                                              admin: metrics, health, reload
 ```
 
-One process, one tokio multi-thread runtime. Whether a thread-per-core layout is faster is a question for the benchmark milestone, not a starting assumption. hyper does the HTTP parsing and framing; menzil does everything around it. See [ADR 0001](adr/0001-hyper-not-a-proxy-framework.md).
+One process, one tokio multi-thread runtime. Whether a thread-per-core layout is faster is a question for the benchmark milestone, not a starting assumption. hyper does the HTTP parsing and framing; waystation does everything around it. See [ADR 0001](adr/0001-hyper-not-a-proxy-framework.md).
 
 ## Configuration
 
@@ -51,7 +51,7 @@ Changes to upstream groups reuse existing pools when the address is unchanged, s
 4. Reject ambiguous framing (see Security).
 5. Match a route: exact host, then wildcard host, then longest path prefix.
 6. Apply the rate limit for the route.
-7. Pick an upstream and send. The body is streamed in both directions; menzil never buffers a whole body.
+7. Pick an upstream and send. The body is streamed in both directions; waystation never buffers a whole body.
 8. Strip hop-by-hop headers both ways. Add `Forwarded` and `X-Forwarded-*`. Pass `traceparent` through unchanged.
 9. Record metrics and the access log line when the response ends or the client goes away.
 
@@ -75,7 +75,7 @@ Weights are supported for both.
 - **Active**: a periodic HTTP check per upstream, with separate thresholds for marking unhealthy and healthy again.
 - **Passive**: an upstream that returns consecutive connection errors or 5xx responses is ejected for a period that grows with repeated ejections. At most a configured share of a group can be ejected, so a bad deploy cannot empty the pool.
 
-When every upstream in a group is unhealthy, menzil sends to all of them anyway. Refusing all traffic because the checks are wrong is worse than trying.
+When every upstream in a group is unhealthy, waystation sends to all of them anyway. Refusing all traffic because the checks are wrong is worse than trying.
 
 ## Timeouts and retries
 
@@ -85,7 +85,7 @@ A request is retried only when no byte of it reached an upstream, or when the me
 
 ## Rate limiting
 
-Token bucket per route, keyed by client address or by a configured header. State is in process; limits are per menzil instance. Over the limit returns 429 with `Retry-After`.
+Token bucket per route, keyed by client address or by a configured header. State is in process; limits are per waystation instance. Over the limit returns 429 with `Retry-After`.
 
 ## Graceful shutdown
 
@@ -99,7 +99,7 @@ On `SIGTERM` or Ctrl-C: stop accepting, send `GOAWAY` on HTTP/2, send `Connectio
 
 ## Security
 
-- **Request smuggling**: a request with both `Content-Length` and `Transfer-Encoding`, with several differing `Content-Length` values, or with obsolete line folding, is answered with 400 and the connection is closed. menzil never forwards a request whose length two parsers could disagree about.
+- **Request smuggling**: a request with both `Content-Length` and `Transfer-Encoding`, with several differing `Content-Length` values, or with obsolete line folding, is answered with 400 and the connection is closed. waystation never forwards a request whose length two parsers could disagree about.
 - **Limits**: header count and size, URI length, concurrent streams per HTTP/2 connection, and resets per connection (against rapid-reset floods).
 - **Slow clients**: head and idle timeouts close connections that trickle bytes.
 - **TLS**: rustls defaults, TLS 1.2 and 1.3. Private keys are read once at load and never logged.
@@ -108,7 +108,7 @@ On `SIGTERM` or Ctrl-C: stop accepting, send `GOAWAY` on HTTP/2, send `Connectio
 
 ## Testing
 
-- Integration tests start menzil and real upstreams in process on ephemeral ports.
+- Integration tests start waystation and real upstreams in process on ephemeral ports.
 - A fault-injecting upstream: slow head, slow body, reset mid-body, wrong length, hang.
 - The smuggling suite, written as raw bytes on a socket because a well-behaved client cannot send them.
 - h2spec in CI on Linux.
@@ -119,10 +119,10 @@ On `SIGTERM` or Ctrl-C: stop accepting, send `GOAWAY` on HTTP/2, send `Connectio
 Published in `docs/benchmarks.md` at M8, on Linux, with the hardware and the commands:
 
 - Fixed-rate load with a generator that corrects for coordinated omission; p50, p99, p99.9 and maximum.
-- Same upstream, same machine, same TLS settings for menzil, nginx and Envoy, plus the upstream called directly as the floor.
+- Same upstream, same machine, same TLS settings for waystation, nginx and Envoy, plus the upstream called directly as the floor.
 - Small responses, large streamed responses, and many idle keep-alive connections (memory per connection).
 
-No target numbers are claimed before they are measured. If menzil is slower, the document says by how much and where the time goes.
+No target numbers are claimed before they are measured. If waystation is slower, the document says by how much and where the time goes.
 
 ## Dependencies
 

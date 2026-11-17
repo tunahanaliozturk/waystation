@@ -12,8 +12,8 @@ Security fixes go into the latest release only.
 
 ## What counts
 
-- A request that menzil forwards although its length or boundaries are ambiguous (request smuggling).
-- Input from a client or an upstream that makes menzil panic, hang, or use memory without bound.
+- A request that waystation forwards although its length or boundaries are ambiguous (request smuggling).
+- Input from a client or an upstream that makes waystation panic, hang, or use memory without bound.
 - A way around a configured limit, timeout or rate limit.
 - A secret (private key, authorization header, cookie) appearing in a log or a metric.
 - Reaching the admin listener from a non-loopback address under the default configuration.
