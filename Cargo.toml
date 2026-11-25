@@ -17,6 +17,9 @@ hyper = { version = "1.13.0", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync", "signal"] }
 
+[dev-dependencies]
+cap = { version = "0.1.2", features = ["stats"] }
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
