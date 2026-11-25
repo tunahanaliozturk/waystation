@@ -1,6 +1,6 @@
 //! What changes in a request head and a response head as they pass through.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use http::uri::Authority;
 use http::{request, response};
@@ -99,14 +99,30 @@ fn request_host(head: &request::Parts, upstream: SocketAddr) -> Option<String> {
     };
     // An authority with no user information is exactly what `Host` may hold,
     // and it can contain no quote, backslash or space, which is what makes it
-    // safe to quote in `Forwarded` below. The `http` crate does not check
-    // that a port is a number, so that is checked here.
+    // safe to quote in `Forwarded` below. The `http` crate checks neither
+    // that a port is a number nor what is in and after brackets, so both are
+    // checked here.
     let port_is_numeric = match host.rsplit_once(':') {
         Some((_, port)) if !port.contains(']') => port.parse::<u16>().is_ok(),
         _ => true,
     };
-    let valid = port_is_numeric && !host.contains('@') && host.parse::<Authority>().is_ok();
+    let valid = port_is_numeric
+        && ip_literal_is_valid(&host)
+        && !host.contains('@')
+        && host.parse::<Authority>().is_ok();
     valid.then_some(host)
+}
+
+/// Whether a host and port that start with a bracket hold an IPv6 address in
+/// the brackets and at most a port after them. Apart from the `IPvFuture`
+/// form, which no client sends, that is all RFC 3986 section 3.2.2 lets in
+/// brackets. A host without brackets passes.
+fn ip_literal_is_valid(host_and_port: &str) -> bool {
+    host_and_port.strip_prefix('[').is_none_or(|rest| {
+        rest.split_once(']').is_some_and(|(address, after)| {
+            address.parse::<Ipv6Addr>().is_ok() && (after.is_empty() || after.starts_with(':'))
+        })
+    })
 }
 
 /// Removes the hop-by-hop headers, including any that `Connection` names.
@@ -269,6 +285,22 @@ mod tests {
         ];
         for request in refused {
             assert_eq!(prepared(request).unwrap_err(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn a_host_in_brackets_must_be_an_ipv6_address() {
+        for host in ["[::1", "[zz]", "[::1]x", "[not-ip]:80", "[]", "[1.2.3.4]"] {
+            let request = Request::get("/").header("host", host);
+            assert_eq!(
+                prepared(request).unwrap_err(),
+                StatusCode::BAD_REQUEST,
+                "{host}"
+            );
+        }
+        for host in ["[::1]", "[2001:db8::1]:8080"] {
+            let head = prepared(Request::get("/").header("host", host)).unwrap();
+            assert_eq!(values(&head, "host"), [host]);
         }
     }
 
