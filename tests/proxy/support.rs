@@ -402,7 +402,8 @@ pub(crate) async fn read_reply(stream: &mut TcpStream) -> Reply {
     }
 }
 
-fn dechunk(mut raw: &[u8]) -> (Vec<u8>, bool) {
+/// Decodes a chunked body, and says whether it ended as chunked bodies must.
+pub(crate) fn dechunk(mut raw: &[u8]) -> (Vec<u8>, bool) {
     let mut body = Vec::new();
     loop {
         let Some(line_end) = raw.windows(2).position(|w| w == b"\r\n") else {
@@ -412,7 +413,17 @@ fn dechunk(mut raw: &[u8]) -> (Vec<u8>, bool) {
         let size = usize::from_str_radix(size.split(';').next().unwrap().trim(), 16).unwrap();
         raw = &raw[line_end + 2..];
         if size == 0 {
-            return (body, true);
+            // The last chunk is followed by trailer fields and a blank line,
+            // and the body is not over until that blank line has arrived.
+            loop {
+                let Some(line_end) = raw.windows(2).position(|w| w == b"\r\n") else {
+                    return (body, false);
+                };
+                if line_end == 0 {
+                    return (body, true);
+                }
+                raw = &raw[line_end + 2..];
+            }
         }
         if raw.len() < size + 2 {
             body.extend_from_slice(&raw[..raw.len().min(size)]);

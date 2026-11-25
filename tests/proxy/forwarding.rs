@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use waystation::Config;
 
-use crate::support::{Fault, Proxy, Upstream, exchange, get, header, headers};
+use crate::support::{Fault, Proxy, Upstream, dechunk, exchange, get, header, headers};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_upstream_sees_the_host_fresh_forwarding_headers_and_no_hop_by_hop_headers() {
@@ -183,4 +183,21 @@ async fn a_refused_upstream_connection_gets_502() {
 
     assert_eq!(reply.status, 502);
     assert_eq!(reply.header("connection"), Some("close"));
+}
+
+#[test]
+fn a_chunked_body_is_complete_only_after_the_blank_line_that_ends_it() {
+    assert_eq!(dechunk(b"5\r\nhello\r\n0\r\n"), (b"hello".to_vec(), false));
+    assert_eq!(
+        dechunk(b"5\r\nhello\r\n0\r\nx-t: 1\r\n"),
+        (b"hello".to_vec(), false)
+    );
+    assert_eq!(
+        dechunk(b"5\r\nhello\r\n0\r\n\r\n"),
+        (b"hello".to_vec(), true)
+    );
+    assert_eq!(
+        dechunk(b"5\r\nhello\r\n0\r\nx-t: 1\r\n\r\n"),
+        (b"hello".to_vec(), true)
+    );
 }
