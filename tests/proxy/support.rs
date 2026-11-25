@@ -81,7 +81,8 @@ pub(crate) enum Fault {
     WrongLength { len: u64, sent: u64 },
     /// Reads the request and never answers.
     Hang,
-    /// Sends these bytes as the response.
+    /// Sends these bytes as the response and closes its sending side, which
+    /// ends a response that has no length.
     Raw(&'static [u8]),
 }
 
@@ -211,7 +212,10 @@ async fn serve(mut stream: TcpStream, fault: Fault, state: &State) -> std::io::R
             stream.shutdown().await?;
         }
         Fault::Hang => {}
-        Fault::Raw(bytes) => stream.write_all(bytes).await?,
+        Fault::Raw(bytes) => {
+            stream.write_all(bytes).await?;
+            stream.shutdown().await?;
+        }
     }
     // Hold the connection until the proxy closes it, so that `open` counts it.
     while stream.read(&mut buf).await? > 0 {}

@@ -61,6 +61,36 @@ async fn the_upstream_sees_the_host_fresh_forwarding_headers_and_no_hop_by_hop_h
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_http_1_0_upstream_still_answers_an_http_1_1_client_in_http_1_1() {
+    // No length: the body ends when the upstream closes the connection.
+    let upstream =
+        Upstream::start(Fault::Raw(b"HTTP/1.0 200 OK\r\nx-kept: yes\r\n\r\nhello")).await;
+    let proxy = Proxy::start(Config::new(upstream.addr));
+    let mut client = tokio::net::TcpStream::connect(proxy.addr).await.unwrap();
+    let request = b"GET / HTTP/1.1\r\nhost: example.test\r\n\r\n";
+
+    // Two requests on one connection: the version decides whether the
+    // client may keep it open.
+    for _ in 0..2 {
+        tokio::io::AsyncWriteExt::write_all(&mut client, request)
+            .await
+            .unwrap();
+        let (head, mut body) = crate::support::read_head(&mut client).await.unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert_eq!(header(&head, "transfer-encoding"), Some("chunked"));
+        while !body.ends_with(b"0\r\n\r\n") {
+            let mut buf = [0; 1024];
+            let n = tokio::io::AsyncReadExt::read(&mut client, &mut buf)
+                .await
+                .unwrap();
+            assert_ne!(n, 0, "connection closed after {head}");
+            body.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(body, b"5\r\nhello\r\n0\r\n\r\n");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_client_sees_no_hop_by_hop_headers_from_the_upstream_and_the_body_reframed() {
     let upstream = Upstream::start(Fault::Raw(
         b"HTTP/1.1 200 OK\r\n\

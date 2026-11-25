@@ -2,8 +2,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use http::request::Parts;
 use http::uri::Authority;
+use http::{request, response};
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Method, StatusCode, Uri, Version};
 
@@ -39,7 +39,7 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 /// Returns the status to answer with when the request cannot be forwarded:
 /// 400 for a missing, repeated or malformed `Host`, 501 for `CONNECT`.
 pub(crate) fn prepare_request(
-    head: &mut Parts,
+    head: &mut request::Parts,
     peer: SocketAddr,
     upstream: SocketAddr,
 ) -> Result<(), StatusCode> {
@@ -66,8 +66,13 @@ pub(crate) fn prepare_request(
 }
 
 /// Turns an upstream's response head into the head sent to the client.
-pub(crate) fn prepare_response(headers: &mut HeaderMap) {
-    strip_hop_by_hop(headers);
+///
+/// The version is this proxy's, not the upstream's (RFC 9110 section 6.2):
+/// an HTTP/1.0 upstream must not make an HTTP/1.1 client close its
+/// connection. hyper still answers an HTTP/1.0 client in HTTP/1.0.
+pub(crate) fn prepare_response(head: &mut response::Parts) {
+    strip_hop_by_hop(&mut head.headers);
+    head.version = Version::HTTP_11;
 }
 
 /// The host the client asked for, or `None` if the request must be refused.
@@ -75,7 +80,7 @@ pub(crate) fn prepare_response(headers: &mut HeaderMap) {
 /// An absolute URI wins over `Host` (RFC 9112 section 3.2.2). Otherwise
 /// HTTP/1.1 needs exactly one valid `Host` (RFC 9112 section 3.2). HTTP/1.0
 /// may leave it out, and then the upstream's address stands in.
-fn request_host(head: &Parts, upstream: SocketAddr) -> Option<String> {
+fn request_host(head: &request::Parts, upstream: SocketAddr) -> Option<String> {
     let mut values = head.headers.get_all(header::HOST).iter();
     let first = values.next();
     if values.next().is_some() {
@@ -155,17 +160,17 @@ mod tests {
     const PEER: &str = "192.0.2.7:51000";
     const UPSTREAM: &str = "127.0.0.1:9000";
 
-    fn head(request: http::request::Builder) -> Parts {
+    fn head(request: request::Builder) -> request::Parts {
         request.body(()).unwrap().into_parts().0
     }
 
-    fn prepared(request: http::request::Builder) -> Result<Parts, StatusCode> {
+    fn prepared(request: request::Builder) -> Result<request::Parts, StatusCode> {
         let mut head = head(request);
         prepare_request(&mut head, PEER.parse().unwrap(), UPSTREAM.parse().unwrap())?;
         Ok(head)
     }
 
-    fn values<'a>(head: &'a Parts, name: &str) -> Vec<&'a str> {
+    fn values<'a>(head: &'a request::Parts, name: &str) -> Vec<&'a str> {
         head.headers
             .get_all(name)
             .iter()
@@ -292,8 +297,9 @@ mod tests {
     }
 
     #[test]
-    fn response_hop_by_hop_headers_are_removed() {
-        let mut headers = HeaderMap::new();
+    fn a_response_loses_its_hop_by_hop_headers_and_the_upstream_version() {
+        let mut head = hyper::Response::new(()).into_parts().0;
+        head.version = Version::HTTP_10;
         for (name, value) in [
             ("connection", "x-internal"),
             ("x-internal", "1"),
@@ -301,10 +307,11 @@ mod tests {
             ("transfer-encoding", "chunked"),
             ("content-type", "text/plain"),
         ] {
-            headers.insert(name, HeaderValue::from_static(value));
+            head.headers.insert(name, HeaderValue::from_static(value));
         }
-        prepare_response(&mut headers);
-        let names: Vec<&str> = headers.keys().map(HeaderName::as_str).collect();
+        prepare_response(&mut head);
+        let names: Vec<&str> = head.headers.keys().map(HeaderName::as_str).collect();
         assert_eq!(names, ["content-type"]);
+        assert_eq!(head.version, Version::HTTP_11);
     }
 }
