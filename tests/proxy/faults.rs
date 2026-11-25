@@ -32,6 +32,41 @@ async fn an_upstream_slower_than_the_head_timeout_gets_504() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_connect_that_hangs_gets_504() {
+    // TEST-NET-1 (RFC 5737) is never routed. Usually the connection attempt
+    // just goes unanswered, and the connect hangs. Where the network answers
+    // at once instead (no route, or something that refuses or accepts for
+    // it), there is no hanging connect to time out, and the test says so and
+    // stops.
+    let addr = "192.0.2.1:80".parse().unwrap();
+    if tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(addr))
+        .await
+        .is_ok()
+    {
+        #[expect(
+            clippy::print_stderr,
+            reason = "the only way to tell the person running the tests that this one did nothing"
+        )]
+        {
+            eprintln!("skipped: a connect to {addr} does not hang on this network");
+        }
+        return;
+    }
+    let proxy = Proxy::start(Config::new(addr).with_connect_timeout(SHORT));
+
+    let start = Instant::now();
+    let reply = exchange(proxy.addr, &get("/")).await;
+
+    assert_eq!(reply.status, 504);
+    assert!(start.elapsed() >= SHORT);
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_head_timeout_starts_only_when_the_upload_is_done() {
     let upstream = Upstream::start(Fault::Echo).await;
     let proxy = Proxy::start(Config::new(upstream.addr).with_response_head_timeout(SHORT));
