@@ -55,6 +55,27 @@ Changes to upstream groups reuse existing pools when the address is unchanged, s
 8. Strip hop-by-hop headers both ways. Add `Forwarded` and `X-Forwarded-*`. Pass `traceparent` through unchanged.
 9. Record metrics and the access log line when the response ends or the client goes away.
 
+### Headers
+
+- **Hop-by-hop** headers are removed in both directions: `Connection` and every header it names, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `Proxy-Authenticate` and `Proxy-Authorization`. hyper writes the framing again for each side, so a chunked request can go upstream with a length and the other way round.
+- **Host** is passed through unchanged. An absolute request URI wins over `Host`, without its user information. An HTTP/1.1 request with no `Host`, more than one, or one that is not a valid host and port gets 400. An HTTP/1.0 request with no `Host` gets the upstream's address.
+- **Forwarding**: `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host` and `X-Forwarded-Proto` are written fresh from what the proxy saw. Until there is a list of trusted proxies (M7), whatever a client sent in them is replaced, never extended. `Via: 1.1 waystation` is appended.
+- `Expect` is not forwarded: hyper answers `100-continue` to the client itself when the body is first read.
+- `CONNECT` gets 501. Tunnels are not planned before 0.1.
+
+### Errors
+
+| Status | When |
+| --- | --- |
+| 400 | Missing, repeated or malformed `Host`; the client broke its request body off. |
+| 408 | The client stopped sending its request body for longer than the idle timeout. |
+| 431 | The request head is larger than the limit. |
+| 501 | `CONNECT`. |
+| 502 | The upstream refused the connection, closed it before a response head, or sent a head that is malformed or larger than the limit. |
+| 504 | The connection to the upstream or its response head took too long, or the request deadline passed before the head. |
+
+Every one of these closes the client connection after the response, because part of the request body may still be unread. Once the response head has gone to the client, a failure can only cut the response off: the connection is closed and the client never sees a complete body. A chunked response gets no last chunk, and a response with a length stops short of it.
+
 ### Backpressure
 
 Bodies are streams. A chunk is read from one side only when the other side can take it, so a slow reader slows the writer instead of filling memory. Per-connection buffers have a fixed upper size.
@@ -80,6 +101,16 @@ When every upstream in a group is unhealthy, waystation sends to all of them any
 ## Timeouts and retries
 
 Timeouts: connect, TLS handshake, request head, idle between body chunks, upstream response head, whole request. Every one has a default; none is infinite.
+
+| Timeout | Counts from | Default | When it fires |
+| --- | --- | --- | --- |
+| Connect | the start of the TCP connect to the upstream | 5 s | 504 |
+| Request head | when the proxy starts waiting for a request, so it also closes idle keep-alive connections | 10 s | the connection is closed |
+| Idle | the moment the proxy starts waiting for the next body chunk from either peer | 60 s | 408 for a stalled upload, a cut-off response for a stalled download |
+| Response head | the last byte of the request body handed to the upstream | 30 s | 504 |
+| Whole request | the request head | 300 s | 504 before the response head, a cut-off response after it |
+
+The idle timer runs only while the proxy is waiting for a peer to send. While the other side is slow to take what was already read, the body is not read at all, so backpressure is never mistaken for a stall. The response head timeout starts only when the upload is done, so a large upload does not use it up.
 
 A request is retried only when no byte of it reached an upstream, or when the method is idempotent and no byte of the response reached the client. Retries go to a different upstream. A retry budget per group caps retries at a share of recent requests, so a failing group does not get twice the load.
 
@@ -127,3 +158,5 @@ No target numbers are claimed before they are measured. If waystation is slower,
 ## Dependencies
 
 tokio, hyper, hyper-util, http-body-util, rustls with tokio-rustls, a TOML parser with serde, arc-swap. Versions are pinned when the first one is added, at the newest stable release. `cargo deny` checks licences and advisories in CI.
+
+In use as of M1: tokio, hyper, hyper-util (the tokio adapters for hyper) and http (for its authority parser; it is in the tree through hyper anyway). http-body-util was not needed: the two body types are written here. The tests add `cap`, a counting allocator, to measure the heap.

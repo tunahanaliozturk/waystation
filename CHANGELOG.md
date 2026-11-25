@@ -4,4 +4,5 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## Unreleased
 
-- Repository scaffold, design document and roadmap. No functional code yet.
+- Repository scaffold, design document and roadmap.
+- Forwarding (M1): HTTP/1.1 to one upstream with streaming bodies, hop-by-hop and forwarding headers, connect, request head, idle, response head and whole-request timeouts, a limit on head size, and cancellation when the client goes away.

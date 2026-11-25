@@ -6,13 +6,33 @@ A way station is a stop on a route where a courier changes horses and the messag
 
 ## Status
 
-Planning. The repository holds the design and the roadmap; no functional code yet.
+Milestone M1 is done: waystation forwards HTTP/1.1 to one upstream, streams bodies both ways, handles hop-by-hop and forwarding headers, and has every timeout from the design apart from the TLS handshake. Routing, pools, TLS and HTTP/2 come in later milestones.
+
+```
+cargo run -- --upstream 127.0.0.1:9000 --listen 127.0.0.1:8080
+```
+
+What is tested so far, end to end, with a client, the proxy and an upstream in one process:
+
+| Claim | Test |
+| --- | --- |
+| A 1 GiB upload and a 1 GiB download pass through intact while the heap of the whole test process stays under 8 MiB (about 1.9 MB measured). | `tests/memory.rs` |
+| A client that disconnects mid-upload, while waiting for the response head, or mid-download leaves no task on the proxy and no open upstream connection, without waiting for a timeout. | `tests/proxy/disconnect.rs` |
+| Hop-by-hop headers, including those named in `Connection`, never cross the proxy in either direction; client-supplied forwarding headers are replaced. | `tests/proxy/forwarding.rs` |
+| An upstream that stalls, resets or sends less than it promised never produces a response that looks complete to the client. | `tests/proxy/faults.rs` |
+| Each timeout fires on its own condition: a slow upload does not use up the response head timeout. | `tests/proxy/faults.rs` |
+
+Each of these tests was checked against a mutation made by hand, a known-wrong change to the proxy that it has to catch. The list is in [docs/roadmap.md](docs/roadmap.md).
+
+More:
 
 - [docs/design.md](docs/design.md): what it does, what it does not do, and how each promise will be tested.
 - [docs/roadmap.md](docs/roadmap.md): milestones, each with an exit test.
 - [docs/adr/](docs/adr/): decisions that are hard to reverse.
 
 ## What it will promise
+
+The full list for 0.1. The first row is tested now; the rest arrive with their milestones.
 
 | Promise | How it will be tested |
 | --- | --- |
