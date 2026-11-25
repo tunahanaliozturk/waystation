@@ -79,18 +79,19 @@ impl From<&BodyError> for Sent {
 /// The idle timer runs only while the proxy is waiting for this body. While
 /// the other side is slow to take what was already read, hyper does not poll
 /// the body, so backpressure from a slow reader is never taken for a stalled
-/// writer.
+/// writer. The deadline is checked on every chunk as well, because a peer
+/// that always has the next chunk ready never makes the proxy wait.
 #[derive(Debug)]
-pub(crate) struct Timed {
-    inner: Incoming,
+pub(crate) struct Timed<B = Incoming> {
+    inner: B,
     idle: Duration,
     deadline: Instant,
     timer: Pin<Box<Sleep>>,
     waiting: bool,
 }
 
-impl Timed {
-    pub(crate) fn new(inner: Incoming, idle: Duration, deadline: Instant) -> Self {
+impl<B: Body<Data = Bytes, Error = hyper::Error> + Unpin> Timed<B> {
+    pub(crate) fn new(inner: B, idle: Duration, deadline: Instant) -> Self {
         Self {
             inner,
             idle,
@@ -104,6 +105,9 @@ impl Timed {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        if Instant::now() >= self.deadline {
+            return Poll::Ready(Some(Err(BodyError::Deadline)));
+        }
         if let Poll::Ready(frame) = Pin::new(&mut self.inner).poll_frame(cx) {
             self.waiting = false;
             return Poll::Ready(frame.map(|frame| frame.map_err(BodyError::Peer)));
@@ -249,5 +253,52 @@ impl Body for ResponseBody {
                     .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::poll_fn;
+
+    /// A peer that always has the next chunk ready, so the proxy never waits.
+    struct Endless;
+
+    impl Body for Endless {
+        type Data = Bytes;
+        type Error = hyper::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"x")))))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_always_ready_still_stops_at_the_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let mut body = Timed::new(Endless, Duration::from_secs(60), deadline);
+        let mut frames = 0_u64;
+        let read = async {
+            loop {
+                match poll_fn(|cx| body.poll_frame(cx)).await {
+                    Some(Ok(_)) => frames += 1,
+                    Some(Err(error)) => break error,
+                    None => panic!("an endless body ended"),
+                }
+                if frames % 1024 == 0 {
+                    // Let the timeout below have a turn.
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+        let error = tokio::time::timeout(Duration::from_secs(10), read)
+            .await
+            .expect("the body went on past the deadline");
+        assert!(matches!(error, BodyError::Deadline), "{error}");
+        assert!(Instant::now() >= deadline);
+        assert!(frames > 0);
     }
 }
