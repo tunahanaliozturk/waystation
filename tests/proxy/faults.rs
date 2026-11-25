@@ -7,7 +7,8 @@ use tokio::net::TcpStream;
 use waystation::Config;
 
 use crate::support::{
-    Fault, PatternCheck, Proxy, Reply, Upstream, exchange, get, read_reply, write_pattern,
+    Fault, PatternCheck, Proxy, Reply, Upstream, eventually, exchange, get, read_head, read_reply,
+    write_pattern,
 };
 
 const SHORT: Duration = Duration::from_millis(300);
@@ -132,6 +133,80 @@ async fn the_request_timeout_cuts_off_a_download_that_keeps_moving() {
         "{:?}",
         start.elapsed()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_request_timeout_cuts_off_an_upload_that_keeps_moving() {
+    let upstream = Upstream::start(Fault::Echo).await;
+    let proxy = Proxy::start(
+        Config::new(upstream.addr)
+            .with_idle_timeout(SHORT)
+            .with_response_head_timeout(LONG)
+            .with_request_timeout(Duration::from_millis(600)),
+    );
+    let stream = TcpStream::connect(proxy.addr).await.unwrap();
+    let (mut reader, mut writer) = stream.into_split();
+    // One byte every 200 ms: never idle for as long as the idle timeout, and
+    // ten seconds in all.
+    let trickle = tokio::spawn(async move {
+        writer
+            .write_all(b"POST / HTTP/1.1\r\nhost: example.test\r\ncontent-length: 50\r\n\r\n")
+            .await?;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            writer.write_all(b"x").await?;
+        }
+        std::io::Result::Ok(())
+    });
+
+    let start = Instant::now();
+    let mut reply = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut reply)).await;
+    trickle.abort();
+
+    assert!(read.is_ok(), "the upload was still going after 5 s");
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+    // A reset can take the answer with it; what did arrive must be the 504.
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(
+        reply.is_empty() || reply.starts_with("HTTP/1.1 504"),
+        "{reply}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_request_timeout_cuts_off_a_client_that_stops_reading() {
+    let upstream = Upstream::start(Fault::Download(16 * 1024 * 1024 * 1024)).await;
+    let timeout = Duration::from_millis(600);
+    let proxy = Proxy::start(
+        Config::new(upstream.addr)
+            .with_idle_timeout(LONG)
+            .with_request_timeout(timeout),
+    );
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let start = Instant::now();
+    client.write_all(&get("/")).await.unwrap();
+    let (head, _) = read_head(&mut client).await.unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    // The client reads no more, so the proxy cannot write, and it does not
+    // poll the body while it cannot write.
+    eventually(Duration::from_secs(3), "upstream connection closed", || {
+        upstream.open() == 0
+    })
+    .await;
+    eventually(
+        Duration::from_secs(1),
+        "proxy back to its accept loop",
+        || proxy.tasks() == 1,
+    )
+    .await;
+    assert!(start.elapsed() >= timeout, "{:?}", start.elapsed());
+    drop(client);
 }
 
 #[tokio::test(flavor = "multi_thread")]

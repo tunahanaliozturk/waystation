@@ -76,10 +76,12 @@ async fn handle(
     config: Arc<Config>,
     shared: Arc<Shared>,
 ) -> Result<Response<ResponseBody>, Infallible> {
+    let deadline = after(config.request_timeout);
+    shared.set_deadline(deadline);
     if shared.next_request_is_ambiguous() {
         return Ok(local_response(StatusCode::BAD_REQUEST));
     }
-    Ok(forward(request, peer, &config)
+    Ok(forward(request, peer, &config, deadline)
         .await
         .unwrap_or_else(local_response))
 }
@@ -110,8 +112,8 @@ async fn forward(
     request: Request<Incoming>,
     peer: SocketAddr,
     config: &Config,
+    deadline: Instant,
 ) -> Result<Response<ResponseBody>, StatusCode> {
-    let deadline = after(config.request_timeout);
     let (mut head, body) = request.into_parts();
     headers::prepare_request(&mut head, peer, config.upstream)?;
 

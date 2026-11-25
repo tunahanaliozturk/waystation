@@ -114,6 +114,8 @@ Timeouts: connect, TLS handshake, request head, idle between body chunks, upstre
 
 The idle timer runs only while the proxy is waiting for a peer to send. While the other side is slow to take what was already read, the body is not read at all, so backpressure is never mistaken for a stall. The response head timeout starts only when the upload is done, so a large upload does not use it up.
 
+The whole-request deadline still holds while the proxy waits for the client to take the response. hyper does not poll a response body it cannot write, so a timer in the body would never fire for a client that stops reading. The deadline is therefore also kept on the client connection itself: a write that is still blocked when it passes fails, hyper ends the connection, and the upstream connection is closed with it.
+
 A request is retried only when no byte of it reached an upstream, or when the method is idempotent and no byte of the response reached the client. Retries go to a different upstream. A retry budget per group caps retries at a share of recent requests, so a failing group does not get twice the load.
 
 ## Rate limiting
