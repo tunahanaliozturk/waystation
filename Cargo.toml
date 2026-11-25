@@ -15,7 +15,9 @@ exclude = ["/.github", "/docs"]
 http = "1.5.0"
 hyper = { version = "1.13.0", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
+serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync", "signal"] }
+toml = { version = "1.2.3", default-features = false, features = ["std", "parse", "serde"] }
 
 [dev-dependencies]
 cap = { version = "0.1.2", features = ["stats"] }
