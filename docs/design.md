@@ -58,6 +58,7 @@ Changes to upstream groups reuse existing pools when the address is unchanged, s
 ### Headers
 
 - **Hop-by-hop** headers are removed in both directions: `Connection` and every header it names, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `Proxy-Authenticate` and `Proxy-Authorization`. hyper writes the framing again for each side, so a chunked request can go upstream with a length and the other way round.
+- **Transfer codings**: the only one accepted is `chunked` on its own. hyper undoes the chunked coding, and `Transfer-Encoding` is removed as hop-by-hop, so any other coding (the gzip in `gzip, chunked`, say) would reach the far side with nothing left to declare it. A request with one gets 501 (RFC 9112 section 6.1), and an upstream response with one gets 502. Decoding such codings on the way through is not planned; no common client or server sends them.
 - **Host** is passed through unchanged. An absolute request URI wins over `Host`, without its user information. An HTTP/1.1 request with no `Host`, more than one, or one that is not a valid host and port gets 400, and that holds for an absolute request URI as well (RFC 9112 section 3.2). A host in brackets must be an IPv6 address, followed by nothing or a port. An HTTP/1.0 request with no `Host` gets the upstream's address.
 - **Forwarding**: `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host` and `X-Forwarded-Proto` are written fresh from what the proxy saw. Until there is a list of trusted proxies (M7), whatever a client sent in them is replaced, never extended. `Via: 1.1 waystation` is appended.
 - **Version**: the response to the client carries the proxy's HTTP version, not the upstream's, so an HTTP/1.0 upstream does not close an HTTP/1.1 client's connection. hyper answers HTTP/1.0 clients in HTTP/1.0.
@@ -71,8 +72,8 @@ Changes to upstream groups reuse existing pools when the address is unchanged, s
 | 400 | Missing, repeated or malformed `Host`; framing two parsers could read differently (see Security); the client broke its request body off. |
 | 408 | The client stopped sending its request body for longer than the idle timeout. |
 | 431 | The request head is larger than the limit. |
-| 501 | `CONNECT`. |
-| 502 | The upstream refused the connection, closed it before a response head, or sent a head that is malformed or larger than the limit. |
+| 501 | `CONNECT`; a request transfer coding other than `chunked` alone. |
+| 502 | The upstream refused the connection, closed it before a response head, or sent a head that is malformed, larger than the limit, or has a transfer coding other than `chunked` alone. |
 | 504 | The connection to the upstream or its response head took too long, or the request deadline passed before the head. |
 
 Every one of these closes the client connection after the response, because part of the request body may still be unread. Once the response head has gone to the client, a failure can only cut the response off: the connection is closed and the client never sees a complete body. A chunked response gets no last chunk, and a response with a length stops short of it.

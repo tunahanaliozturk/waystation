@@ -37,13 +37,14 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 /// # Errors
 ///
 /// Returns the status to answer with when the request cannot be forwarded:
-/// 400 for a missing, repeated or malformed `Host`, 501 for `CONNECT`.
+/// 400 for a missing, repeated or malformed `Host`, 501 for `CONNECT` and for
+/// a transfer coding other than `chunked`.
 pub(crate) fn prepare_request(
     head: &mut request::Parts,
     peer: SocketAddr,
     upstream: SocketAddr,
 ) -> Result<(), StatusCode> {
-    if head.method == Method::CONNECT {
+    if head.method == Method::CONNECT || !framing_is_chunked_or_plain(&head.headers) {
         return Err(StatusCode::NOT_IMPLEMENTED);
     }
     let host = request_host(head, upstream).ok_or(StatusCode::BAD_REQUEST)?;
@@ -70,9 +71,36 @@ pub(crate) fn prepare_request(
 /// The version is this proxy's, not the upstream's (RFC 9110 section 6.2):
 /// an HTTP/1.0 upstream must not make an HTTP/1.1 client close its
 /// connection. hyper still answers an HTTP/1.0 client in HTTP/1.0.
-pub(crate) fn prepare_response(head: &mut response::Parts) {
+///
+/// # Errors
+///
+/// Returns 502 for a transfer coding other than `chunked`.
+pub(crate) fn prepare_response(head: &mut response::Parts) -> Result<(), StatusCode> {
+    if !framing_is_chunked_or_plain(&head.headers) {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
     strip_hop_by_hop(&mut head.headers);
     head.version = Version::HTTP_11;
+    Ok(())
+}
+
+/// Whether a message has no transfer coding or `chunked` alone.
+///
+/// `Transfer-Encoding` is hop-by-hop and is removed on the way through, and
+/// hyper undoes only the chunked coding. Any other coding, such as the gzip
+/// in `gzip, chunked`, would reach the far side with nothing left to say it
+/// is there, so such a message is not forwarded at all (RFC 9112 section 6.1
+/// lets a server answer an unknown coding with 501).
+fn framing_is_chunked_or_plain(headers: &HeaderMap) -> bool {
+    let mut codings = headers
+        .get_all(header::TRANSFER_ENCODING)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|&byte| byte == b','))
+        .map(<[u8]>::trim_ascii)
+        .filter(|coding| !coding.is_empty());
+    codings
+        .next()
+        .is_none_or(|first| first.eq_ignore_ascii_case(b"chunked") && codings.next().is_none())
 }
 
 /// The host the client asked for, or `None` if the request must be refused.
@@ -347,7 +375,7 @@ mod tests {
         ] {
             head.headers.insert(name, HeaderValue::from_static(value));
         }
-        prepare_response(&mut head);
+        prepare_response(&mut head).unwrap();
         let names: Vec<&str> = head.headers.keys().map(HeaderName::as_str).collect();
         assert_eq!(names, ["content-type"]);
         assert_eq!(head.version, Version::HTTP_11);

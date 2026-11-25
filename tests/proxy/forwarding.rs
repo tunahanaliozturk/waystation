@@ -185,6 +185,38 @@ async fn a_request_body_that_looks_like_a_request_head_is_not_taken_for_one() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_request_with_a_transfer_coding_besides_chunked_gets_501_and_goes_nowhere() {
+    let upstream = Upstream::start(Fault::Echo).await;
+    let proxy = Proxy::start(Config::new(upstream.addr));
+
+    for coding in ["gzip, chunked", "chunked, chunked"] {
+        let request = format!(
+            "POST / HTTP/1.1\r\nhost: example.test\r\ntransfer-encoding: {coding}\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+        );
+        let reply = exchange(proxy.addr, request.as_bytes()).await;
+        assert_eq!(reply.status, 501, "{coding}");
+    }
+    assert_eq!(upstream.accepted(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_response_with_a_transfer_coding_besides_chunked_gets_502() {
+    let responses: [&'static [u8]; 2] = [
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        // Without chunked last, the body runs to the end of the connection.
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: gzip\r\n\r\nhello",
+    ];
+    for response in responses {
+        let upstream = Upstream::start(Fault::Raw(response)).await;
+        let proxy = Proxy::start(Config::new(upstream.addr));
+
+        let reply = exchange(proxy.addr, &get("/")).await;
+
+        assert_eq!(reply.status, 502, "{}", String::from_utf8_lossy(response));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_request_head_over_the_limit_gets_431_and_never_reaches_the_upstream() {
     let upstream = Upstream::start(Fault::Echo).await;
     let proxy = Proxy::start(Config::new(upstream.addr).with_max_header_bytes(16 * 1024));

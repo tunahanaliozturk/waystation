@@ -175,7 +175,7 @@ async fn forward(
     };
 
     let (mut head, body) = response.into_parts();
-    headers::prepare_response(&mut head);
+    headers::prepare_response(&mut head)?;
     let body = ResponseBody::Upstream {
         body: Timed::new(body, config.idle_timeout, deadline),
         connection: upstream,
