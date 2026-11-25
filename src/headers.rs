@@ -77,13 +77,13 @@ pub(crate) fn prepare_response(head: &mut response::Parts) {
 
 /// The host the client asked for, or `None` if the request must be refused.
 ///
-/// An absolute URI wins over `Host` (RFC 9112 section 3.2.2). Otherwise
-/// HTTP/1.1 needs exactly one valid `Host` (RFC 9112 section 3.2). HTTP/1.0
-/// may leave it out, and then the upstream's address stands in.
+/// HTTP/1.1 needs exactly one `Host`, even with an absolute URI (RFC 9112
+/// section 3.2), and then the URI wins over it (section 3.2.2). HTTP/1.0 may
+/// leave `Host` out, and then the upstream's address stands in.
 fn request_host(head: &request::Parts, upstream: SocketAddr) -> Option<String> {
     let mut values = head.headers.get_all(header::HOST).iter();
     let first = values.next();
-    if values.next().is_some() {
+    if values.next().is_some() || (first.is_none() && head.version != Version::HTTP_10) {
         return None;
     }
     let host = if let Some(host) = head.uri.host() {
@@ -94,10 +94,8 @@ fn request_host(head: &request::Parts, upstream: SocketAddr) -> Option<String> {
         }
     } else if let Some(value) = first {
         value.to_str().ok()?.to_owned()
-    } else if head.version == Version::HTTP_10 {
-        upstream.to_string()
     } else {
-        return None;
+        upstream.to_string()
     };
     // An authority with no user information is exactly what `Host` may hold,
     // and it can contain no quote, backslash or space, which is what makes it
@@ -281,6 +279,14 @@ mod tests {
                 .unwrap();
         assert_eq!(values(&head, "host"), ["origin.test:81"]);
         assert_eq!(head.uri, "/p?q");
+    }
+
+    #[test]
+    fn an_http_1_1_request_in_absolute_form_still_needs_a_host() {
+        let request = Request::get("http://origin.test/p");
+        assert_eq!(prepared(request).unwrap_err(), StatusCode::BAD_REQUEST);
+        let request = Request::get("http://origin.test/p").version(Version::HTTP_10);
+        assert_eq!(values(&prepared(request).unwrap(), "host"), ["origin.test"]);
     }
 
     #[test]

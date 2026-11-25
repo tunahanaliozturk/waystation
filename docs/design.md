@@ -58,7 +58,7 @@ Changes to upstream groups reuse existing pools when the address is unchanged, s
 ### Headers
 
 - **Hop-by-hop** headers are removed in both directions: `Connection` and every header it names, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `Proxy-Authenticate` and `Proxy-Authorization`. hyper writes the framing again for each side, so a chunked request can go upstream with a length and the other way round.
-- **Host** is passed through unchanged. An absolute request URI wins over `Host`, without its user information. An HTTP/1.1 request with no `Host`, more than one, or one that is not a valid host and port gets 400. An HTTP/1.0 request with no `Host` gets the upstream's address.
+- **Host** is passed through unchanged. An absolute request URI wins over `Host`, without its user information. An HTTP/1.1 request with no `Host`, more than one, or one that is not a valid host and port gets 400, and that holds for an absolute request URI as well (RFC 9112 section 3.2). An HTTP/1.0 request with no `Host` gets the upstream's address.
 - **Forwarding**: `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host` and `X-Forwarded-Proto` are written fresh from what the proxy saw. Until there is a list of trusted proxies (M7), whatever a client sent in them is replaced, never extended. `Via: 1.1 waystation` is appended.
 - **Version**: the response to the client carries the proxy's HTTP version, not the upstream's, so an HTTP/1.0 upstream does not close an HTTP/1.1 client's connection. hyper answers HTTP/1.0 clients in HTTP/1.0.
 - `Expect` is not forwarded: hyper answers `100-continue` to the client itself when the body is first read.
