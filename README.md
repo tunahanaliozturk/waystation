@@ -20,7 +20,8 @@ What is tested so far, end to end, with a client, the proxy and an upstream in o
 | A client that disconnects mid-upload, while waiting for the response head, or mid-download leaves no task on the proxy and no open upstream connection, without waiting for a timeout. | `tests/proxy/disconnect.rs` |
 | Hop-by-hop headers, including those named in `Connection`, never cross the proxy in either direction; client-supplied forwarding headers are replaced. | `tests/proxy/forwarding.rs` |
 | An upstream that stalls, resets or sends less than it promised never produces a response that looks complete to the client. | `tests/proxy/faults.rs` |
-| Each timeout fires on its own condition: a slow upload does not use up the response head timeout. | `tests/proxy/faults.rs` |
+| Each timeout fires on its own condition, and each has a test that waits it out: connect, request head, response head, idle in both directions, and the whole-request deadline on an upload, on a download that keeps moving and on a client that stops reading. A slow upload does not use up the response head timeout. The connect test needs a connection attempt to 192.0.2.1 to go unanswered, as it does on most networks; where it is answered at once, the test prints that it was skipped. | `tests/proxy/faults.rs` |
+| A request with both `Content-Length` and `Transfer-Encoding`, two different lengths or a last coding other than `chunked` gets 400 and never reaches the upstream; any transfer coding other than `chunked` alone gets 501 from a client and 502 from the upstream. | `tests/proxy/forwarding.rs` |
 
 Each of these tests was checked against a mutation made by hand, a known-wrong change to the proxy that it has to catch. The list is in [docs/roadmap.md](docs/roadmap.md).
 
