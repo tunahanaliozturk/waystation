@@ -11,6 +11,12 @@ keywords = ["proxy", "reverse-proxy", "load-balancer", "http", "http2"]
 categories = ["network-programming", "web-programming::http-server"]
 exclude = ["/.github", "/docs"]
 
+[dependencies]
+http = "1.5.0"
+hyper = { version = "1.13.0", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync", "signal"] }
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
