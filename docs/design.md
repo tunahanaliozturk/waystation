@@ -68,7 +68,7 @@ Changes to upstream groups reuse existing pools when the address is unchanged, s
 
 | Status | When |
 | --- | --- |
-| 400 | Missing, repeated or malformed `Host`; the client broke its request body off. |
+| 400 | Missing, repeated or malformed `Host`; framing two parsers could read differently (see Security); the client broke its request body off. |
 | 408 | The client stopped sending its request body for longer than the idle timeout. |
 | 431 | The request head is larger than the limit. |
 | 501 | `CONNECT`. |
@@ -131,7 +131,7 @@ On `SIGTERM` or Ctrl-C: stop accepting, send `GOAWAY` on HTTP/2, send `Connectio
 
 ## Security
 
-- **Request smuggling**: a request with both `Content-Length` and `Transfer-Encoding`, with several differing `Content-Length` values, or with obsolete line folding, is answered with 400 and the connection is closed. waystation never forwards a request whose length two parsers could disagree about.
+- **Request smuggling**: a request with both `Content-Length` and `Transfer-Encoding`, with several differing `Content-Length` values, with a last transfer coding other than `chunked`, or with obsolete line folding, is answered with 400 and the connection is closed. waystation never forwards a request whose length two parsers could disagree about. hyper refuses all of these itself except the first: it reads a request with both fields by its transfer coding and drops the length before the proxy sees the head. So the bytes from the client are read a second time on their way into hyper (`src/framing.rs`), only to find out whether a head had both. That reading follows the framing of every request hyper accepts and keeps at most one short line; it decides nothing about what is forwarded, and on bytes hyper would refuse it stops, because hyper closes the connection on them.
 - **Limits**: header count and size, URI length, concurrent streams per HTTP/2 connection, and resets per connection (against rapid-reset floods).
 - **Slow clients**: head and idle timeouts close connections that trickle bytes.
 - **TLS**: rustls defaults, TLS 1.2 and 1.3. Private keys are read once at load and never logged.

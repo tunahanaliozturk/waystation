@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use waystation::Config;
 
-use crate::support::{Fault, Proxy, Upstream, dechunk, exchange, get, header, headers};
+use crate::support::{Fault, PATIENCE, Proxy, Upstream, dechunk, exchange, get, header, headers};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_upstream_sees_the_host_fresh_forwarding_headers_and_no_hop_by_hop_headers() {
@@ -129,6 +129,59 @@ async fn a_request_without_a_valid_host_is_refused_before_any_upstream_connectio
         assert_eq!(reply.status, 400, "{}", String::from_utf8_lossy(request));
     }
     assert_eq!(upstream.accepted(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_whose_length_two_parsers_could_read_differently_gets_400_and_goes_nowhere() {
+    let upstream = Upstream::start(Fault::Echo).await;
+    let proxy = Proxy::start(Config::new(upstream.addr));
+
+    let requests: [&[u8]; 4] = [
+        // A length and a transfer coding, in both orders.
+        b"POST / HTTP/1.1\r\nhost: example.test\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        b"POST / HTTP/1.1\r\nhost: example.test\r\ntransfer-encoding: chunked\r\ncontent-length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        // Two lengths that differ.
+        b"POST / HTTP/1.1\r\nhost: example.test\r\ncontent-length: 5\r\ncontent-length: 6\r\n\r\nhello!",
+        // A transfer coding whose last coding is not chunked, so nothing
+        // says where the body ends.
+        b"POST / HTTP/1.1\r\nhost: example.test\r\ntransfer-encoding: chunked, gzip\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    ];
+    for request in requests {
+        let reply = exchange(proxy.addr, request).await;
+        assert_eq!(reply.status, 400, "{}", String::from_utf8_lossy(request));
+    }
+    assert_eq!(upstream.accepted(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_body_that_looks_like_a_request_head_is_not_taken_for_one() {
+    let upstream = Upstream::start(Fault::Echo).await;
+    let proxy = Proxy::start(Config::new(upstream.addr));
+    // Three requests on one connection. The body of the first holds what
+    // would be a refused head, and the third is one.
+    let body = "GET /x HTTP/1.1\r\ncontent-length: 1\r\ntransfer-encoding: chunked\r\n\r\n";
+    let requests = format!(
+        "POST /a HTTP/1.1\r\nhost: example.test\r\ncontent-length: {}\r\n\r\n{body}\
+         GET /b HTTP/1.1\r\nhost: example.test\r\n\r\n\
+         POST /c HTTP/1.1\r\nhost: example.test\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        body.len()
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(proxy.addr).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut stream, requests.as_bytes())
+        .await
+        .unwrap();
+    let mut replies = Vec::new();
+    let read = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut replies);
+    let _ = tokio::time::timeout(PATIENCE, read).await.unwrap();
+
+    let replies = String::from_utf8_lossy(&replies);
+    let statuses: Vec<&str> = replies
+        .match_indices("HTTP/1.1 ")
+        .map(|(at, _)| &replies[at + 9..at + 12])
+        .collect();
+    assert_eq!(statuses, ["200", "200", "400"], "{replies}");
+    assert_eq!(upstream.accepted(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]

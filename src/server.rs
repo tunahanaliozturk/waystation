@@ -20,6 +20,7 @@ use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 
 use crate::Config;
 use crate::body::{RequestBody, ResponseBody, Sent, Timed};
+use crate::downstream::{Downstream, Shared};
 use crate::headers;
 
 /// Pause after a failed accept, so that a lasting error such as running out of
@@ -57,7 +58,10 @@ async fn connection(stream: TcpStream, peer: SocketAddr, config: Arc<Config>) {
         .timer(TokioTimer::new())
         .header_read_timeout(config.request_head_timeout)
         .max_header_size(config.max_header_bytes);
-    let service = service_fn(move |request| handle(request, peer, Arc::clone(&config)));
+    let shared = Arc::new(Shared::new());
+    let stream = Downstream::new(stream, Arc::clone(&shared));
+    let service =
+        service_fn(move |request| handle(request, peer, Arc::clone(&config), Arc::clone(&shared)));
     // The error says why the connection ended. The client already has
     // whatever answer there was, and there is no access log yet (M6) to put
     // the reason in.
@@ -70,7 +74,11 @@ async fn handle(
     request: Request<Incoming>,
     peer: SocketAddr,
     config: Arc<Config>,
+    shared: Arc<Shared>,
 ) -> Result<Response<ResponseBody>, Infallible> {
+    if shared.next_request_is_ambiguous() {
+        return Ok(local_response(StatusCode::BAD_REQUEST));
+    }
     Ok(forward(request, peer, &config)
         .await
         .unwrap_or_else(local_response))

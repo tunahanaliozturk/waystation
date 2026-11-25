@@ -7,6 +7,8 @@
 
 mod body;
 mod config;
+mod downstream;
+mod framing;
 mod headers;
 mod server;
 
