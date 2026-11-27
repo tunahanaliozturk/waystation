@@ -43,16 +43,19 @@ pub(crate) struct Group {
     servers: Vec<Arc<Server>>,
     /// Running sums of the weights, for drawing a server by weight.
     cumulative: Vec<u64>,
-    /// The current weights of smooth round robin.
+    /// The current weights of smooth round robin. Each stays above minus
+    /// the total and below the number of servers times the total, which
+    /// `i128` holds for any total that fits `u64`.
     // ponytail: one lock per pick for round robin; a precomputed schedule
     // and an atomic index would avoid it if the lock ever shows in a profile.
-    current: Mutex<Vec<i64>>,
+    current: Mutex<Vec<i128>>,
     random: Random,
 }
 
 impl Group {
     /// A group of `servers`, each an address and a weight of at least one.
-    /// Returns `None` for an empty list or a weight of zero.
+    /// Returns `None` for an empty list, a weight of zero, or weights that
+    /// add up to more than `u64::MAX`.
     pub(crate) fn new(
         policy: Policy,
         servers: &[(SocketAddr, u32)],
@@ -72,13 +75,7 @@ impl Group {
                 })
             })
             .collect();
-        let cumulative = servers
-            .iter()
-            .scan(0, |sum, server| {
-                *sum += server.weight;
-                Some(*sum)
-            })
-            .collect();
+        let cumulative = running_sums(servers.iter().map(|server| server.weight))?;
         Some(Self {
             policy,
             current: Mutex::new(vec![0; servers.len()]),
@@ -109,16 +106,16 @@ impl Group {
     fn next_in_turn(&self) -> usize {
         let total = self.cumulative.last().copied().unwrap_or(0);
         let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut best: Option<(usize, i64)> = None;
+        let mut best: Option<(usize, i128)> = None;
         for (index, (value, server)) in current.iter_mut().zip(&self.servers).enumerate() {
-            *value += signed(server.weight);
+            *value += i128::from(server.weight);
             if best.is_none_or(|(_, top)| *value > top) {
                 best = Some((index, *value));
             }
         }
         let best = best.map_or(0, |(index, _)| index);
         if let Some(value) = current.get_mut(best) {
-            *value -= signed(total);
+            *value -= i128::from(total);
         }
         best
     }
@@ -149,8 +146,16 @@ impl Group {
     }
 }
 
-fn signed(weight: u64) -> i64 {
-    i64::try_from(weight).unwrap_or(i64::MAX)
+/// The running sums of `weights`, or `None` if the total does not fit.
+fn running_sums(weights: impl IntoIterator<Item = u64>) -> Option<Vec<u64>> {
+    let mut sum: u64 = 0;
+    weights
+        .into_iter()
+        .map(|weight| {
+            sum = sum.checked_add(weight)?;
+            Some(sum)
+        })
+        .collect()
 }
 
 /// A request counted against a server for as long as it is alive.
@@ -269,5 +274,15 @@ mod tests {
         assert!(Group::new(Policy::RoundRobin, &[], pool).is_none());
         let addr = SocketAddr::from(([127, 0, 0, 1], 1));
         assert!(Group::new(Policy::RoundRobin, &[(addr, 0)], pool).is_none());
+    }
+
+    #[test]
+    fn weights_that_add_up_past_the_largest_total_make_no_group() {
+        assert_eq!(running_sums([1, 2, 5]), Some(vec![1, 3, 8]));
+        assert_eq!(
+            running_sums([u64::MAX - 1, 1]),
+            Some(vec![u64::MAX - 1, u64::MAX])
+        );
+        assert_eq!(running_sums([u64::MAX, 1]), None);
     }
 }

@@ -15,4 +15,5 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 - The command line takes `--config FILE` in place of `--upstream` and `--listen`.
 - A body whose next chunk is always ready stops at the request deadline; before, only a body the proxy had to wait for did.
 - A configuration file whose upstream server is the proxy's own listen address is rejected, instead of sending each request back into the proxy.
+- An upstream group whose weights add up to more than `u64::MAX` is rejected, and round robin no longer cuts a total above `i64::MAX` down to it.
 - A request head timeout too long to add to the clock, such as `18446744073709551615s`, is cut down to a year; before, every client connection panicked.

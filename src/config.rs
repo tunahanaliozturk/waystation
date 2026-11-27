@@ -384,10 +384,15 @@ impl Check<'_> {
                 servers.push((addr, weight));
             }
             let built = Group::new(group.balance, &servers, pool).ok_or_else(|| {
-                self.error(
-                    group.servers.span(),
-                    format!("upstream group `{name}` has no servers"),
-                )
+                let message = if servers.is_empty() {
+                    format!("upstream group `{name}` has no servers")
+                } else {
+                    format!(
+                        "the weights in upstream group `{name}` add up to more than {}",
+                        u64::MAX
+                    )
+                };
+                self.error(group.servers.span(), message)
             })?;
             groups.insert(name.as_str(), Arc::new(built));
         }
