@@ -11,7 +11,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 - Any transfer coding other than `chunked` alone gets 501 in a request and 502 in an upstream response, instead of reaching the far side undeclared.
 - The whole-request deadline also ends a request whose client stops reading the response.
 - Routing and balancing (M2): a TOML configuration file (`waystation --config FILE`), checked as a whole, with the line and column of the first problem in every error. Routes by exact host, wildcard host and path prefix. Upstream groups with weighted round robin and weighted least requests (power of two choices).
-- Upstream connections are kept per server and reused. A connection goes back only after a whole response; one the upstream closed or sent stray bytes on is closed, never used; a request that fails on a reused connection is sent once more on a new one only when that cannot repeat it.
+- Upstream connections are kept per server and reused. A connection goes back only after a whole response; one the upstream has closed, or sent stray bytes on, by the time it is taken from the pool is closed, not used (ADR 0003 describes the short window after that check); a request that fails on a reused connection is sent once more on a new one only when that cannot repeat it.
 - The command line takes `--config FILE` in place of `--upstream` and `--listen`.
 - A body whose next chunk is always ready stops at the request deadline; before, only a body the proxy had to wait for did.
 - A configuration file whose upstream server is the proxy's own listen address is rejected, instead of sending each request back into the proxy.
