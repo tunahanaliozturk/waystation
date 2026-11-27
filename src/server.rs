@@ -34,6 +34,9 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// closed by the upstream.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
+/// What a timeout too long to add to the clock is cut down to.
+const A_YEAR: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 /// Accepts connections on `listener` and forwards every request on them by
 /// the routes in `config`.
 ///
@@ -73,7 +76,8 @@ async fn connection(stream: TcpStream, peer: SocketAddr, config: Arc<Config>) {
     let mut builder = server::Builder::new();
     builder
         .timer(TokioTimer::new())
-        .header_read_timeout(config.request_head_timeout)
+        // hyper adds this to the clock unchecked, and panics if it overflows.
+        .header_read_timeout(config.request_head_timeout.min(A_YEAR))
         .max_header_size(config.max_header_bytes);
     let shared = Arc::new(Shared::new());
     let stream = Downstream::new(stream, Arc::clone(&shared));
@@ -348,8 +352,7 @@ fn copy_head(head: &request::Parts) -> request::Parts {
 /// long to represent.
 fn after(timeout: Duration) -> Instant {
     let now = Instant::now();
-    now.checked_add(timeout)
-        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
+    now.checked_add(timeout).unwrap_or_else(|| now + A_YEAR)
 }
 
 #[cfg(test)]

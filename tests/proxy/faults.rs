@@ -313,6 +313,38 @@ async fn a_client_too_slow_with_its_request_head_is_disconnected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn timeouts_too_long_to_add_to_the_clock_still_let_requests_through() {
+    let upstream = Upstream::start(Fault::Echo).await;
+    let longest = format!("\"{}s\"", u64::MAX);
+    let config = Config::from_toml(&format!(
+        r#"
+        [timeouts]
+        connect = {longest}
+        request_head = {longest}
+        response_head = {longest}
+        idle = {longest}
+        request = {longest}
+
+        [pool]
+        idle_timeout = {longest}
+
+        [upstreams.app]
+        servers = [{{ address = "{}" }}]
+
+        [[routes]]
+        upstream = "app"
+        "#,
+        upstream.addr
+    ))
+    .unwrap();
+    let proxy = Proxy::start(config);
+
+    let reply = exchange(proxy.addr, &get("/")).await;
+
+    assert_eq!((reply.status, reply.text()), (200, "bytes=0 pattern=ok"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_large_upload_and_download_arrive_intact() {
     const LEN: u64 = 32 * 1024 * 1024;
     let upstream = Upstream::start(Fault::Echo).await;
