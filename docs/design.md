@@ -69,7 +69,7 @@ upstream = "api"
 
 A duration is a whole number with `ms`, `s` or `m`, and above zero. A server address is an IP address and a port; host names wait for DNS support. Unknown keys are errors, so a misspelt key is not silently ignored.
 
-The file is checked as a whole: TOML syntax, types and ranges, server addresses, weights of at least 1, a server listed twice in a group, a group with no servers, route hosts (a name, an IP address or `*.` and a name, without a port), route paths (starting with `/`, with no query or fragment), a route to a group that does not exist, two routes for the same host and path, and a file with no routes. The first problem rejects the file with its line and column, for example `line 7, column 12: there is no upstream group `api``. Every rule has an example file under `tests/config/invalid/` that names the line it must be reported on, and `tests/config.rs` checks each.
+The file is checked as a whole: TOML syntax, types and ranges, server addresses, weights of at least 1, a server listed twice in a group, a server that is the proxy's own listen address (which would send its requests back to the proxy), a group with no servers, route hosts (a name, an IP address or `*.` and a name, without a port), route paths (starting with `/`, with no query or fragment), a route to a group that does not exist, two routes for the same host and path, and a file with no routes. The first problem rejects the file with its line and column, for example `line 7, column 12: there is no upstream group `api``. Every rule has an example file under `tests/config/invalid/` that names the line it must be reported on, and `tests/config.rs` checks each.
 
 M2 reads the file once at start (`waystation --config FILE`); reloading arrives in M5.
 

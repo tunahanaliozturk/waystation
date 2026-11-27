@@ -294,7 +294,7 @@ impl File {
             idle_timeout: check
                 .duration_or(self.pool.idle_timeout.as_ref(), defaults.idle_timeout)?,
         };
-        let groups = check.groups(&self.upstreams, pool)?;
+        let groups = check.groups(&self.upstreams, pool, listen)?;
         let routes = check.routes(&self.routes, &groups)?;
 
         let mut config = Config::with_routes(listen, routes, groups.into_values().collect());
@@ -354,6 +354,7 @@ impl Check<'_> {
         &self,
         upstreams: &'g BTreeMap<String, GroupFile>,
         pool: PoolSettings,
+        listen: SocketAddr,
     ) -> Result<BTreeMap<&'g str, Arc<Group>>, ConfigError> {
         let mut groups = BTreeMap::new();
         for (name, group) in upstreams {
@@ -361,6 +362,14 @@ impl Check<'_> {
             for server in group.servers.get_ref() {
                 let addr = address(&server.address)
                     .map_err(|message| self.error(server.address.span(), message))?;
+                if is_listener(addr, listen) {
+                    return Err(self.error(
+                        server.address.span(),
+                        format!(
+                            "server {addr} is the address this proxy listens on, so its requests would come back to it"
+                        ),
+                    ));
+                }
                 if servers.iter().any(|&(seen, _)| seen == addr) {
                     return Err(self.error(
                         server.address.span(),
@@ -461,6 +470,19 @@ fn address(text: &Spanned<String>) -> Result<SocketAddr, String> {
             text.get_ref()
         )
     })
+}
+
+/// Whether a connection to `server` would reach the proxy's own listener
+/// on `listen`: the same address, or the same port on the loopback or
+/// unspecified address of a listener on every address of that family.
+/// Other addresses of this machine are not known here.
+fn is_listener(server: SocketAddr, listen: SocketAddr) -> bool {
+    let local = server.ip().is_loopback() || server.ip().is_unspecified();
+    server == listen
+        || (listen.ip().is_unspecified()
+            && server.port() == listen.port()
+            && server.is_ipv4() == listen.is_ipv4()
+            && local)
 }
 
 /// A duration written as a whole number and a unit: `ms`, `s` or `m`. Zero

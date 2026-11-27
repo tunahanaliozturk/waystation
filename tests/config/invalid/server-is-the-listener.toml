@@ -1,0 +1,9 @@
+# line 6: is the address this proxy listens on
+
+listen = "127.0.0.1:8080"
+
+[upstreams.app]
+servers = [{ address = "127.0.0.1:8080" }]
+
+[[routes]]
+upstream = "app"

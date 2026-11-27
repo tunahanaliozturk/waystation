@@ -14,4 +14,5 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 - Upstream connections are kept per server and reused. A connection goes back only after a whole response; one the upstream closed or sent stray bytes on is closed, never used; a request that fails on a reused connection is sent once more on a new one only when that cannot repeat it.
 - The command line takes `--config FILE` in place of `--upstream` and `--listen`.
 - A body whose next chunk is always ready stops at the request deadline; before, only a body the proxy had to wait for did.
+- A configuration file whose upstream server is the proxy's own listen address is rejected, instead of sending each request back into the proxy.
 - A request head timeout too long to add to the clock, such as `18446744073709551615s`, is cut down to a year; before, every client connection panicked.
