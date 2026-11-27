@@ -190,6 +190,18 @@ host: example.test
 
     assert_eq!(reply.status, 200, "{}", reply.head);
     assert_eq!((upstream.accepted(), upstream.requests()), (3, 4));
+
+    // When the new connection fails too, that is the end of it: 502, and
+    // no third attempt.
+    let upstream = Upstream::start(Fault::AnswerOnce).await;
+    let proxy = Proxy::start(Config::new(upstream.addr));
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    assert_eq!(keep_alive_request(&mut client, request).await.status, 200);
+
+    let reply = keep_alive_request(&mut client, request).await;
+
+    assert_eq!(reply.status, 502, "{}", reply.head);
+    assert_eq!((upstream.accepted(), upstream.requests()), (2, 3));
 }
 
 #[tokio::test(flavor = "multi_thread")]

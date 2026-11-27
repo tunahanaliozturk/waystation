@@ -98,6 +98,10 @@ pub(crate) enum Fault {
     /// is read and the connection closed without an answer, as when the
     /// server closes an idle connection just as a request arrives.
     AnswerFirstOnly,
+    /// Like `Echo` for the first request this upstream gets at all; every
+    /// later one, on any connection, new or not, is read and the connection
+    /// closed without an answer.
+    AnswerOnce,
 }
 
 impl Fault {
@@ -111,6 +115,7 @@ impl Fault {
                 | Self::CloseWhenIdle(_)
                 | Self::HalfCloseWhenIdle(_)
                 | Self::AnswerFirstOnly
+                | Self::AnswerOnce
         )
     }
 }
@@ -222,14 +227,16 @@ async fn serve(mut stream: TcpStream, fault: Fault, state: &State) -> std::io::R
             }
             Err(error) => return Err(error),
         };
-        state.requests.fetch_add(1, Ordering::SeqCst);
+        let earlier = state.requests.fetch_add(1, Ordering::SeqCst);
         {
             let mut heads = state.heads.lock().unwrap();
             if heads.len() < 1000 {
                 heads.push(head.clone());
             }
         }
-        if matches!(fault, Fault::AnswerFirstOnly) && index > 0 {
+        if matches!(fault, Fault::AnswerFirstOnly) && index > 0
+            || matches!(fault, Fault::AnswerOnce) && earlier > 0
+        {
             return Ok(());
         }
         let length = header(&head, "content-length").map_or(0, |v| v.parse().unwrap());
@@ -270,6 +277,7 @@ async fn respond(
         | Fault::CloseWhenIdle(_)
         | Fault::HalfCloseWhenIdle(_)
         | Fault::AnswerFirstOnly
+        | Fault::AnswerOnce
         | Fault::ExtraBytes(_) => {
             let body = format!("bytes={} pattern={}", check.len, check.verdict());
             stream
