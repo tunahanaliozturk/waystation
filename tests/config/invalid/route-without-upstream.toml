@@ -1,0 +1,6 @@
+# line 5: missing field `upstream`
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]
+
+[[routes]]
+path = "/api"

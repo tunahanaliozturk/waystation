@@ -1,0 +1,7 @@
+# line 6: is not a host name
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]
+
+[[routes]]
+host = "api.*.example.test"
+upstream = "app"

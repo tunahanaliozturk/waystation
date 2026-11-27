@@ -1,0 +1,6 @@
+# line 2: invalid type
+listen = 8080
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]
+[[routes]]
+upstream = "app"

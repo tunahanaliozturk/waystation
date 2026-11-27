@@ -1,0 +1,8 @@
+# line 5: a weight is at least 1
+[upstreams.app]
+servers = [
+  { address = "127.0.0.1:9001" },
+  { address = "127.0.0.1:9002", weight = 0 },
+]
+[[routes]]
+upstream = "app"

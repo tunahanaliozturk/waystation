@@ -1,0 +1,7 @@
+# line 7: there is no upstream group `api`
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]
+
+[[routes]]
+host = "api.example.test"
+upstream = "api"

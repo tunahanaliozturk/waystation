@@ -11,11 +11,13 @@ use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
-use hyper::client::conn::http1::Connection;
+use hyper::client::conn::http1::{Connection, SendRequest};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::time::{Instant, Sleep, sleep_until};
+
+use crate::balance::Lease;
 
 /// The upstream end of one forwarded request.
 pub(crate) type Upstream = Connection<TokioIo<TcpStream>, RequestBody>;
@@ -136,20 +138,22 @@ impl<B: Body<Data = Bytes, Error = hyper::Error> + Unpin> Timed<B> {
 /// whole body has been sent.
 #[derive(Debug)]
 pub(crate) struct RequestBody {
-    body: Timed,
+    /// `None` for a request without a body.
+    body: Option<Timed>,
     report: Option<oneshot::Sender<Sent>>,
 }
 
 impl RequestBody {
-    /// Wraps `body` and returns the receiver that hears how it ended.
-    pub(crate) fn new(body: Timed) -> (Self, oneshot::Receiver<Sent>) {
+    /// Wraps `body`, or stands for no body at all, and returns the receiver
+    /// that hears how it ended.
+    pub(crate) fn new(body: Option<Timed>) -> (Self, oneshot::Receiver<Sent>) {
         let (sender, receiver) = oneshot::channel();
         let mut this = Self {
             body,
             report: Some(sender),
         };
         // hyper never polls a body that is empty from the start.
-        if this.body.inner.is_end_stream() {
+        if this.is_end_stream() {
             this.ended(Sent::Complete);
         }
         (this, receiver)
@@ -173,11 +177,14 @@ impl Body for RequestBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         let this = self.get_mut();
-        let frame = ready!(this.body.poll_frame(cx));
+        let Some(body) = this.body.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let frame = ready!(body.poll_frame(cx));
         match &frame {
             None => this.ended(Sent::Complete),
             // hyper stops polling after a frame that ends the stream.
-            Some(Ok(_)) if this.body.inner.is_end_stream() => this.ended(Sent::Complete),
+            Some(Ok(_)) if body.inner.is_end_stream() => this.ended(Sent::Complete),
             Some(Ok(_)) => {}
             Some(Err(error)) => this.ended(error.into()),
         }
@@ -185,11 +192,15 @@ impl Body for RequestBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.body.inner.is_end_stream()
+        self.body
+            .as_ref()
+            .is_none_or(|body| body.inner.is_end_stream())
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.body.inner.size_hint()
+        self.body
+            .as_ref()
+            .map_or_else(|| SizeHint::with_exact(0), |body| body.inner.size_hint())
     }
 }
 
@@ -197,20 +208,62 @@ impl Body for RequestBody {
 #[derive(Debug)]
 pub(crate) enum ResponseBody {
     /// Streamed from the upstream.
-    ///
-    /// The upstream connection lives here, not in a task of its own. It has
-    /// to be polled for the body to arrive, and the rest of an upload may
-    /// still be going out on it. When the client goes away, hyper drops this
-    /// body, and dropping the connection closes the socket to the upstream.
-    /// Nothing is left running.
-    Upstream {
-        /// The body as the upstream sends it.
-        body: Timed,
-        /// The connection, until it has finished.
-        connection: Option<Pin<Box<Upstream>>>,
-    },
+    Upstream(Streaming),
     /// Written by the proxy itself, for an error.
     Local(Option<Bytes>),
+}
+
+/// A response body on its way from the upstream, with the connection it
+/// arrives on.
+///
+/// The upstream connection lives here, not in a task of its own (ADR 0002).
+/// It has to be polled for the body to arrive, and the rest of an upload may
+/// still be going out on it. When the client goes away, hyper drops this
+/// body, and dropping the connection closes the socket to the upstream.
+/// Nothing is left running. When the body was read to its end instead, the
+/// connection goes back to the server's pool (ADR 0003).
+#[derive(Debug)]
+pub(crate) struct Streaming {
+    body: Timed,
+    /// The connection, until it has finished.
+    connection: Option<Pin<Box<Upstream>>>,
+    sender: Option<SendRequest<RequestBody>>,
+    /// The request, counted against its server until this is dropped.
+    lease: Lease,
+    /// Whether the upstream's body ended the way its framing says it should.
+    ended: bool,
+}
+
+impl Streaming {
+    /// `connection` is `None` when it finished with the response head, and
+    /// then there is nothing to give back.
+    pub(crate) fn new(
+        body: Timed,
+        sender: SendRequest<RequestBody>,
+        connection: Option<Pin<Box<Upstream>>>,
+        lease: Lease,
+    ) -> Self {
+        Self {
+            body,
+            connection,
+            sender: Some(sender),
+            lease,
+            ended: false,
+        }
+    }
+}
+
+impl Drop for Streaming {
+    fn drop(&mut self) {
+        // hyper does not poll a body that is empty from the start, so an
+        // empty body is complete without having been read.
+        if !(self.ended || self.body.inner.is_end_stream()) {
+            return;
+        }
+        if let (Some(sender), Some(connection)) = (self.sender.take(), self.connection.take()) {
+            self.lease.server().pool.put((sender, connection));
+        }
+    }
 }
 
 impl Body for ResponseBody {
@@ -222,16 +275,23 @@ impl Body for ResponseBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         match self.get_mut() {
-            Self::Upstream { body, connection } => {
+            Self::Upstream(streaming) => {
                 // A connection that fails reports the failure into the body
                 // as well, so its own result can be dropped here.
-                let finished = connection
+                let finished = streaming
+                    .connection
                     .as_mut()
                     .is_some_and(|upstream| upstream.as_mut().poll(cx).is_ready());
                 if finished {
-                    *connection = None;
+                    streaming.connection = None;
                 }
-                body.poll_frame(cx)
+                let frame = ready!(streaming.body.poll_frame(cx));
+                streaming.ended = match &frame {
+                    None => true,
+                    Some(Ok(_)) => streaming.body.inner.is_end_stream(),
+                    Some(Err(_)) => false,
+                };
+                Poll::Ready(frame)
             }
             Self::Local(bytes) => Poll::Ready(bytes.take().map(|bytes| Ok(Frame::data(bytes)))),
         }
@@ -239,14 +299,14 @@ impl Body for ResponseBody {
 
     fn is_end_stream(&self) -> bool {
         match self {
-            Self::Upstream { body, .. } => body.inner.is_end_stream(),
+            Self::Upstream(streaming) => streaming.body.inner.is_end_stream(),
             Self::Local(bytes) => bytes.is_none(),
         }
     }
 
     fn size_hint(&self) -> SizeHint {
         match self {
-            Self::Upstream { body, .. } => body.inner.size_hint(),
+            Self::Upstream(streaming) => streaming.body.inner.size_hint(),
             Self::Local(bytes) => SizeHint::with_exact(
                 bytes
                     .as_ref()

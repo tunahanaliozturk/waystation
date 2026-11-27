@@ -5,12 +5,15 @@
 //! not a stable API. The design is in `docs/design.md` and the milestones are
 //! in `docs/roadmap.md`.
 
+mod balance;
 mod body;
 mod config;
 mod downstream;
 mod framing;
 mod headers;
+mod pool;
+mod route;
 mod server;
 
-pub use config::Config;
+pub use config::{Config, ConfigError};
 pub use server::serve;

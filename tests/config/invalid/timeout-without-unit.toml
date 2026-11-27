@@ -1,0 +1,8 @@
+# line 3: is not a duration
+[timeouts]
+connect = "5"
+
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]
+[[routes]]
+upstream = "app"

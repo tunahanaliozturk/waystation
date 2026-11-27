@@ -1,0 +1,5 @@
+# line 3: host names are not supported
+[upstreams.app]
+servers = [{ address = "app.internal:80" }]
+[[routes]]
+upstream = "app"

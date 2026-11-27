@@ -1,0 +1,7 @@
+# line 6: is not a route path
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]
+
+[[routes]]
+path = "/search?q=1"
+upstream = "app"

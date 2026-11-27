@@ -1,0 +1,9 @@
+# line 4: above zero
+[timeouts]
+connect = "5s"
+idle = "0s"
+
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]
+[[routes]]
+upstream = "app"

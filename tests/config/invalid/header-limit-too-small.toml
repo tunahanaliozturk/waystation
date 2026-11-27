@@ -1,0 +1,8 @@
+# line 3: at least 1024
+[limits]
+max_header_bytes = 100
+
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]
+[[routes]]
+upstream = "app"

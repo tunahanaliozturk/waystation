@@ -181,7 +181,7 @@ async fn a_request_body_that_looks_like_a_request_head_is_not_taken_for_one() {
         .map(|(at, _)| &replies[at + 9..at + 12])
         .collect();
     assert_eq!(statuses, ["200", "200", "400"], "{replies}");
-    assert_eq!(upstream.accepted(), 2);
+    assert_eq!(upstream.requests(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]

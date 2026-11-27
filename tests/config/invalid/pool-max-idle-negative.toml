@@ -1,0 +1,8 @@
+# line 3: invalid value
+[pool]
+max_idle_per_server = -1
+
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]
+[[routes]]
+upstream = "app"

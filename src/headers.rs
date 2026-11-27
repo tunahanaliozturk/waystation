@@ -27,35 +27,45 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 
-/// Turns a client's request head into the head sent upstream.
-///
-/// The host is taken from the request, the hop-by-hop headers are removed,
-/// and the forwarding headers are written fresh. Until there is a list of
-/// trusted proxies (milestone M7), no client is trusted, so any forwarding
-/// headers it sent are replaced, not extended.
+/// Checks that a client's request can be forwarded at all, and returns the
+/// host it is for: `None` for an HTTP/1.0 request without one.
 ///
 /// # Errors
 ///
-/// Returns the status to answer with when the request cannot be forwarded:
-/// 400 for a missing, repeated or malformed `Host`, 501 for `CONNECT` and for
-/// a transfer coding other than `chunked`.
-pub(crate) fn prepare_request(
-    head: &mut request::Parts,
-    peer: SocketAddr,
-    upstream: SocketAddr,
-) -> Result<(), StatusCode> {
+/// Returns the status to answer with: 400 for a missing, repeated or
+/// malformed `Host`, 501 for `CONNECT` and for a transfer coding other than
+/// `chunked`.
+pub(crate) fn check_request(head: &request::Parts) -> Result<Option<String>, StatusCode> {
     if head.method == Method::CONNECT || !framing_is_chunked_or_plain(&head.headers) {
         return Err(StatusCode::NOT_IMPLEMENTED);
     }
-    let host = request_host(head, upstream).ok_or(StatusCode::BAD_REQUEST)?;
+    request_host(head)
+}
+
+/// Turns a client's request head into the head sent upstream, for `host`.
+///
+/// The hop-by-hop headers are removed, and the forwarding headers are
+/// written fresh. Until there is a list of trusted proxies (milestone M7), no
+/// client is trusted, so any forwarding headers it sent are replaced, not
+/// extended.
+///
+/// # Errors
+///
+/// Returns 400 when a header value cannot be written, which a host that
+/// passed [`check_request`] never causes.
+pub(crate) fn prepare_request(
+    head: &mut request::Parts,
+    peer: SocketAddr,
+    host: &str,
+) -> Result<(), StatusCode> {
     strip_hop_by_hop(&mut head.headers);
     // hyper already answered `100-continue` to the client when the body was
     // first read, so the upstream must not be asked to answer it again.
     head.headers.remove(header::EXPECT);
-    set_forwarding(&mut head.headers, peer, &host)?;
+    set_forwarding(&mut head.headers, peer, host)?;
     head.headers.insert(
         header::HOST,
-        HeaderValue::from_str(&host).map_err(|_| StatusCode::BAD_REQUEST)?,
+        HeaderValue::from_str(host).map_err(|_| StatusCode::BAD_REQUEST)?,
     );
     head.uri = head
         .uri
@@ -103,16 +113,17 @@ fn framing_is_chunked_or_plain(headers: &HeaderMap) -> bool {
         .is_none_or(|first| first.eq_ignore_ascii_case(b"chunked") && codings.next().is_none())
 }
 
-/// The host the client asked for, or `None` if the request must be refused.
+/// The host the client asked for, `None` for an HTTP/1.0 request without
+/// one, or 400 if the request must be refused.
 ///
 /// HTTP/1.1 needs exactly one `Host`, even with an absolute URI (RFC 9112
 /// section 3.2), and then the URI wins over it (section 3.2.2). HTTP/1.0 may
 /// leave `Host` out, and then the upstream's address stands in.
-fn request_host(head: &request::Parts, upstream: SocketAddr) -> Option<String> {
+fn request_host(head: &request::Parts) -> Result<Option<String>, StatusCode> {
     let mut values = head.headers.get_all(header::HOST).iter();
     let first = values.next();
     if values.next().is_some() || (first.is_none() && head.version != Version::HTTP_10) {
-        return None;
+        return Err(StatusCode::BAD_REQUEST);
     }
     let host = if let Some(host) = head.uri.host() {
         // Built from host and port so that any user information is left out.
@@ -121,9 +132,12 @@ fn request_host(head: &request::Parts, upstream: SocketAddr) -> Option<String> {
             None => host.to_owned(),
         }
     } else if let Some(value) = first {
-        value.to_str().ok()?.to_owned()
+        value
+            .to_str()
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+            .to_owned()
     } else {
-        upstream.to_string()
+        return Ok(None);
     };
     // An authority with no user information is exactly what `Host` may hold,
     // and it can contain no quote, backslash or space, which is what makes it
@@ -138,7 +152,11 @@ fn request_host(head: &request::Parts, upstream: SocketAddr) -> Option<String> {
         && ip_literal_is_valid(&host)
         && !host.contains('@')
         && host.parse::<Authority>().is_ok();
-    valid.then_some(host)
+    if valid {
+        Ok(Some(host))
+    } else {
+        Err(StatusCode::BAD_REQUEST)
+    }
 }
 
 /// Whether a host and port that start with a bracket hold an IPv6 address in
@@ -208,7 +226,8 @@ mod tests {
 
     fn prepared(request: request::Builder) -> Result<request::Parts, StatusCode> {
         let mut head = head(request);
-        prepare_request(&mut head, PEER.parse().unwrap(), UPSTREAM.parse().unwrap())?;
+        let host = check_request(&head)?.unwrap_or_else(|| UPSTREAM.to_owned());
+        prepare_request(&mut head, PEER.parse().unwrap(), &host)?;
         Ok(head)
     }
 
@@ -277,7 +296,7 @@ mod tests {
         prepare_request(
             &mut head,
             "[2001:db8::1]:4000".parse().unwrap(),
-            UPSTREAM.parse().unwrap(),
+            "example.test",
         )
         .unwrap();
         assert_eq!(
@@ -293,7 +312,7 @@ mod tests {
         prepare_request(
             &mut head,
             "[::ffff:192.0.2.9]:4000".parse().unwrap(),
-            UPSTREAM.parse().unwrap(),
+            "example.test",
         )
         .unwrap();
         assert_eq!(values(&head, "x-forwarded-for"), ["192.0.2.9"]);

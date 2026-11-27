@@ -84,6 +84,31 @@ pub(crate) enum Fault {
     /// Sends these bytes as the response and closes its sending side, which
     /// ends a response that has no length.
     Raw(&'static [u8]),
+    /// Like `Echo`, but the first response on each connection is followed,
+    /// after this pause, by the bytes of a second response nobody asked
+    /// for, whose body is `STALE`. Later requests on the connection are
+    /// answered as `Echo`.
+    ExtraBytes(Duration),
+    /// Like `Echo`, but closes a connection that stays idle this long.
+    CloseWhenIdle(Duration),
+    /// Like `Echo` for the first request on each connection; any later one
+    /// is read and the connection closed without an answer, as when the
+    /// server closes an idle connection just as a request arrives.
+    AnswerFirstOnly,
+}
+
+impl Fault {
+    /// Whether the upstream answers more than one request on a connection.
+    fn keeps_alive(self) -> bool {
+        matches!(
+            self,
+            Self::Echo
+                | Self::Download(_)
+                | Self::ExtraBytes(_)
+                | Self::CloseWhenIdle(_)
+                | Self::AnswerFirstOnly
+        )
+    }
 }
 
 /// An upstream on 127.0.0.1 that records what reached it.
@@ -97,6 +122,11 @@ struct State {
     open: AtomicUsize,
     accepted: AtomicUsize,
     received: AtomicU64,
+    requests: AtomicUsize,
+    /// Responses nobody asked for, sent by `ExtraBytes`.
+    extra: AtomicUsize,
+    /// Kept only for the first thousand requests, so that a long run does
+    /// not hold every head.
     heads: Mutex<Vec<String>>,
 }
 
@@ -142,36 +172,109 @@ impl Upstream {
     pub(crate) fn last_head(&self) -> String {
         self.state.heads.lock().unwrap().last().cloned().unwrap()
     }
+
+    /// Every request head received so far, as text.
+    pub(crate) fn heads(&self) -> Vec<String> {
+        self.state.heads.lock().unwrap().clone()
+    }
+
+    /// Requests received so far, over all connections.
+    pub(crate) fn requests(&self) -> usize {
+        self.state.requests.load(Ordering::SeqCst)
+    }
+
+    /// Responses nobody asked for that have been written so far.
+    pub(crate) fn extra_sent(&self) -> usize {
+        self.state.extra.load(Ordering::SeqCst)
+    }
 }
 
 async fn serve(mut stream: TcpStream, fault: Fault, state: &State) -> std::io::Result<()> {
-    let (head, rest) = read_head(&mut stream).await?;
-    state.heads.lock().unwrap().push(head.clone());
-    let length = header(&head, "content-length").map_or(0, |v| v.parse().unwrap());
-    let mut check = PatternCheck::default();
-    check.feed(&rest);
-    state.received.fetch_add(wide(rest.len()), Ordering::SeqCst);
     let mut buf = vec![0; CHUNK];
-    while check.len < length {
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
+    for index in 0_usize.. {
+        let next = read_head(&mut stream);
+        let read = match fault {
+            Fault::CloseWhenIdle(idle) if index > 0 => {
+                let Ok(read) = tokio::time::timeout(idle, next).await else {
+                    return Ok(());
+                };
+                read
+            }
+            _ => next.await,
+        };
+        let (head, rest) = match read {
+            Ok(read) => read,
+            // The proxy closed a connection it kept for later.
+            Err(error) if index > 0 && error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        state.requests.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut heads = state.heads.lock().unwrap();
+            if heads.len() < 1000 {
+                heads.push(head.clone());
+            }
+        }
+        if matches!(fault, Fault::AnswerFirstOnly) && index > 0 {
             return Ok(());
         }
-        check.feed(&buf[..n]);
-        state.received.fetch_add(wide(n), Ordering::SeqCst);
+        let length = header(&head, "content-length").map_or(0, |v| v.parse().unwrap());
+        let mut check = PatternCheck::default();
+        check.feed(&rest);
+        state.received.fetch_add(wide(rest.len()), Ordering::SeqCst);
+        while check.len < length {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            check.feed(&buf[..n]);
+            state.received.fetch_add(wide(n), Ordering::SeqCst);
+        }
+        let head_only = head.starts_with("HEAD ");
+        respond(&mut stream, fault, index, &check, head_only, state).await?;
+        // A chunked request body is not read here, so its connection
+        // cannot carry another request.
+        if !fault.keeps_alive() || header(&head, "transfer-encoding").is_some() {
+            break;
+        }
     }
+    // Hold the connection until the proxy closes it, so that `open` counts it.
+    while stream.read(&mut buf).await? > 0 {}
+    Ok(())
+}
 
+async fn respond(
+    stream: &mut TcpStream,
+    fault: Fault,
+    index: usize,
+    check: &PatternCheck,
+    head_only: bool,
+    state: &State,
+) -> std::io::Result<()> {
     match fault {
-        Fault::Echo => {
+        Fault::Echo | Fault::CloseWhenIdle(_) | Fault::AnswerFirstOnly | Fault::ExtraBytes(_) => {
             let body = format!("bytes={} pattern={}", check.len, check.verdict());
             stream
                 .write_all(ok_head(wide(body.len())).as_bytes())
                 .await?;
-            stream.write_all(body.as_bytes()).await?;
+            if !head_only {
+                stream.write_all(body.as_bytes()).await?;
+            }
+            if let (Fault::ExtraBytes(pause), 0) = (fault, index) {
+                stream.flush().await?;
+                tokio::time::sleep(pause).await;
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nSTALE")
+                    .await?;
+                stream.flush().await?;
+                state.extra.fetch_add(1, Ordering::SeqCst);
+            }
         }
         Fault::Download(len) => {
             stream.write_all(ok_head(len).as_bytes()).await?;
-            write_pattern(&mut stream, len).await?;
+            write_pattern(stream, len).await?;
         }
         Fault::SlowHead(wait) => {
             tokio::time::sleep(wait).await;
@@ -180,7 +283,7 @@ async fn serve(mut stream: TcpStream, fault: Fault, state: &State) -> std::io::R
         }
         Fault::Stall { len, sent } => {
             stream.write_all(ok_head(len).as_bytes()).await?;
-            write_pattern(&mut stream, sent).await?;
+            write_pattern(stream, sent).await?;
         }
         Fault::Trickle { len, every } => {
             stream.write_all(ok_head(len).as_bytes()).await?;
@@ -199,16 +302,16 @@ async fn serve(mut stream: TcpStream, fault: Fault, state: &State) -> std::io::R
                 .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
                 .await?;
             stream.write_all(format!("{sent:x}\r\n").as_bytes()).await?;
-            write_pattern(&mut stream, sent).await?;
+            write_pattern(stream, sent).await?;
             stream.write_all(b"\r\n").await?;
             stream.flush().await?;
             tokio::time::sleep(Duration::from_millis(50)).await;
             stream.set_zero_linger()?;
-            return Ok(());
+            return Err(std::io::ErrorKind::ConnectionReset.into());
         }
         Fault::WrongLength { len, sent } => {
             stream.write_all(ok_head(len).as_bytes()).await?;
-            write_pattern(&mut stream, sent).await?;
+            write_pattern(stream, sent).await?;
             stream.shutdown().await?;
         }
         Fault::Hang => {}
@@ -217,8 +320,6 @@ async fn serve(mut stream: TcpStream, fault: Fault, state: &State) -> std::io::R
             stream.shutdown().await?;
         }
     }
-    // Hold the connection until the proxy closes it, so that `open` counts it.
-    while stream.read(&mut buf).await? > 0 {}
     Ok(())
 }
 
@@ -362,6 +463,43 @@ pub(crate) async fn exchange(proxy: SocketAddr, request: &[u8]) -> Reply {
     let mut stream = TcpStream::connect(proxy).await.unwrap();
     stream.write_all(request).await.unwrap();
     read_reply(&mut stream).await
+}
+
+/// Sends `request` on a connection that stays open, and reads one whole
+/// response with a `Content-Length` from it.
+pub(crate) async fn keep_alive_request(stream: &mut TcpStream, request: &[u8]) -> Reply {
+    stream.write_all(request).await.unwrap();
+    let read = async {
+        let Ok((head, mut body)) = read_head(stream).await else {
+            // Closed before a whole head arrived.
+            return (String::new(), Vec::new());
+        };
+        let len: usize = header(&head, "content-length").map_or(0, |v| v.parse().unwrap());
+        let mut buf = vec![0; CHUNK];
+        while body.len() < len {
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&buf[..n]);
+        }
+        (head, body)
+    };
+    let (head, body) = tokio::time::timeout(PATIENCE, read)
+        .await
+        .expect("the proxy did not answer");
+    let status = head
+        .split(' ')
+        .nth(1)
+        .map_or(0, |status| status.parse().unwrap());
+    let complete = header(&head, "content-length")
+        .is_some_and(|len| len.parse::<usize>().unwrap() == body.len());
+    Reply {
+        status,
+        head,
+        body,
+        complete,
+    }
 }
 
 /// Reads a whole response, and then on until the connection closes.

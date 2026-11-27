@@ -3,47 +3,64 @@
 use std::convert::Infallible;
 use std::future::poll_fn;
 use std::net::SocketAddr;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use hyper::body::{Bytes, Incoming};
-use hyper::client::conn::http1 as client;
+use http::request;
+use hyper::body::{Body as _, Bytes, Incoming};
+use hyper::client::conn::http1::{self as client, SendRequest};
 use hyper::header::{self, HeaderValue};
 use hyper::server::conn::http1 as server;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{Instant, sleep, sleep_until, timeout_at};
+use tokio::sync::oneshot;
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep, sleep_until, timeout_at};
 
 use crate::Config;
-use crate::body::{RequestBody, ResponseBody, Sent, Timed};
+use crate::body::{RequestBody, ResponseBody, Sent, Streaming, Timed, Upstream};
 use crate::downstream::{Downstream, Shared};
 use crate::headers;
+use crate::pool::Halves;
 
 /// Pause after a failed accept, so that a lasting error such as running out of
 /// file descriptors does not spin the loop.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
-/// Accepts connections on `listener` and forwards every request on them to
-/// the upstream in `config`.
+/// How often idle upstream connections are checked for expiry and for being
+/// closed by the upstream.
+const SWEEP_EVERY: Duration = Duration::from_secs(1);
+
+/// Accepts connections on `listener` and forwards every request on them by
+/// the routes in `config`.
 ///
 /// Each connection is served on a task of its own. The future never
 /// completes; dropping it stops accepting, and connections already open run
-/// to their end.
+/// to their end. Between accepts, once a second, the idle upstream
+/// connections are swept, so that no task of its own is needed for that.
 pub async fn serve(listener: TcpListener, config: Config) -> Infallible {
     let config = Arc::new(config);
+    let mut sweep = interval(SWEEP_EVERY);
+    sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                tokio::spawn(connection(stream, peer, Arc::clone(&config)));
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, peer)) => {
+                    tokio::spawn(connection(stream, peer, Arc::clone(&config)));
+                }
+                // Accept fails when a connection was reset before it was
+                // taken or the process is out of file descriptors. Neither is
+                // a reason to stop listening.
+                Err(_) => sleep(ACCEPT_BACKOFF).await,
+            },
+            _ = sweep.tick() => {
+                for server in config.groups.iter().flat_map(|group| group.servers()) {
+                    server.pool.sweep();
+                }
             }
-            // Accept fails when a connection was reset before it was taken
-            // or the process is out of file descriptors. Neither is a reason
-            // to stop listening.
-            Err(_) => sleep(ACCEPT_BACKOFF).await,
         }
     }
 }
@@ -103,11 +120,14 @@ fn local_response(status: StatusCode) -> Response<ResponseBody> {
     response
 }
 
-/// Forwards one request on a new upstream connection and returns the
-/// response with its body still streaming.
+/// Forwards one request to a server of the group its route names and
+/// returns the response with its body still streaming.
 ///
-/// There is one upstream connection per request until connection pools
-/// arrive in milestone M2.
+/// The request goes on an idle connection to that server if there is one.
+/// When a reused connection fails before a response head, the request is
+/// sent once more on a new connection, but only if that cannot do it twice:
+/// hyper gave it back unsent, or it is idempotent and has no body, so that
+/// it can be built again from its head (ADR 0003).
 async fn forward(
     request: Request<Incoming>,
     peer: SocketAddr,
@@ -115,74 +135,189 @@ async fn forward(
     deadline: Instant,
 ) -> Result<Response<ResponseBody>, StatusCode> {
     let (mut head, body) = request.into_parts();
-    headers::prepare_request(&mut head, peer, config.upstream)?;
+    let host = headers::check_request(&head)?;
+    let group = config
+        .router
+        .find(host.as_deref(), head.uri.path())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let lease = group.pick().ok_or(StatusCode::BAD_GATEWAY)?;
+    let addr = lease.server().addr;
+    let host = host.unwrap_or_else(|| addr.to_string());
+    headers::prepare_request(&mut head, peer, &host)?;
 
+    let empty = body.is_end_stream();
+    let copy = (empty && head.method.is_idempotent()).then(|| copy_head(&head));
+    let body = (!empty).then(|| Timed::new(body, config.idle_timeout, deadline));
+    let (body, mut sent) = RequestBody::new(body);
+    let mut request = Request::from_parts(head, body);
+    let mut ended = None;
+    let mut reuse = true;
+    loop {
+        let pooled = if reuse {
+            lease.server().pool.take()
+        } else {
+            None
+        };
+        let reused = pooled.is_some();
+        let (mut sender, connection) = match pooled {
+            Some(halves) => halves,
+            None => connect(addr, config, deadline).await?,
+        };
+        let exchange = Exchange {
+            sent: &mut sent,
+            ended: &mut ended,
+            config,
+            deadline,
+        };
+        let failure = match exchange.send(&mut sender, connection, request).await {
+            Ok((response, connection)) => {
+                let (mut head, body) = response.into_parts();
+                headers::prepare_response(&mut head)?;
+                let body = Timed::new(body, config.idle_timeout, deadline);
+                let body = ResponseBody::Upstream(Streaming::new(body, sender, connection, lease));
+                return Ok(Response::from_parts(head, body));
+            }
+            Err(failure) => failure,
+        };
+        // Once only, and only from a reused connection: a new connection that
+        // fails says something about the server, not about the pool.
+        reuse = false;
+        request = match (failure, &copy) {
+            (Failure::Unsent(unsent), _) if reused => *unsent,
+            (Failure::Broken, Some(copy)) if reused => {
+                let (body, receiver) = RequestBody::new(None);
+                sent = receiver;
+                ended = None;
+                Request::from_parts(copy_head(copy), body)
+            }
+            (Failure::Status(status), _) => return Err(status),
+            (Failure::Unsent(_) | Failure::Broken, _) => {
+                // The body reports how it ended before it hands hyper an
+                // error, so when the client caused the failure, that is known
+                // by now.
+                return Err(match ended.or_else(|| sent.try_recv().ok()) {
+                    Some(Sent::Idle) => StatusCode::REQUEST_TIMEOUT,
+                    Some(Sent::Broken) => StatusCode::BAD_REQUEST,
+                    Some(Sent::Deadline) => StatusCode::GATEWAY_TIMEOUT,
+                    Some(Sent::Complete) | None => StatusCode::BAD_GATEWAY,
+                });
+            }
+        };
+    }
+}
+
+/// How sending a request failed.
+enum Failure {
+    /// hyper gave the request back without writing any of it.
+    Unsent(Box<Request<RequestBody>>),
+    /// The connection broke before a response head.
+    Broken,
+    /// A timeout ran out; the status says which.
+    Status(StatusCode),
+}
+
+/// Opens a new connection to `addr`.
+async fn connect(
+    addr: SocketAddr,
+    config: &Config,
+    deadline: Instant,
+) -> Result<Halves, StatusCode> {
     let connect_by = after(config.connect_timeout).min(deadline);
-    let stream = match timeout_at(connect_by, TcpStream::connect(config.upstream)).await {
+    let stream = match timeout_at(connect_by, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(_)) => return Err(StatusCode::BAD_GATEWAY),
         Err(_) => return Err(StatusCode::GATEWAY_TIMEOUT),
     };
     let _ = stream.set_nodelay(true);
-    let (mut sender, upstream) = client::Builder::new()
+    let (sender, connection) = client::Builder::new()
         .max_header_size(config.max_header_bytes)
         .handshake(TokioIo::new(stream))
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let mut upstream = Some(Box::pin(upstream));
+    Ok((sender, Box::pin(connection)))
+}
 
-    let (body, mut sent) = RequestBody::new(Timed::new(body, config.idle_timeout, deadline));
-    let mut response = pin!(sender.send_request(Request::from_parts(head, body)));
-    // Until the whole request body is sent, the only limit is the request
-    // deadline: an upload may take as long as it needs while it keeps moving,
-    // and the idle timeout in the body catches it when it stops. Once the
-    // body is sent, the response head timeout starts.
-    let mut timer = pin!(sleep_until(deadline));
-    let mut ended = None;
+/// What one attempt at sending a request shares with the next.
+struct Exchange<'a> {
+    /// Hears how the request body ended.
+    sent: &'a mut oneshot::Receiver<Sent>,
+    /// How it ended, once that is known.
+    ended: &'a mut Option<Sent>,
+    config: &'a Config,
+    deadline: Instant,
+}
 
-    // What each branch drops when another one wins:
-    // - `response` wins: nothing. The upstream connection moves into the
-    //   response body and goes on serving it.
-    // - `upstream` wins: the connection has finished, perhaps with an error
-    //   after handing over a response head, so the loop goes on until
-    //   `response` says which. Nothing is dropped.
-    // - `sent` wins: nothing is dropped; it only moves the timer.
-    // - `timer` wins: the request and the upstream connection are dropped,
-    //   which closes the socket to the upstream, and the client gets 504
-    //   with `Connection: close`.
-    let response = loop {
-        tokio::select! {
-            biased;
-            result = &mut response => break result.ok(),
-            _ = poll_fn(|cx| upstream.as_mut().map_or(Poll::Pending, |c| c.as_mut().poll(cx))) => {
-                upstream = None;
+impl Exchange<'_> {
+    /// Sends `request` on a connection and waits for the response head,
+    /// polling the connection meanwhile. Returns the head and the
+    /// connection, `None` if it has already finished.
+    async fn send(
+        self,
+        sender: &mut SendRequest<RequestBody>,
+        connection: Pin<Box<Upstream>>,
+        request: Request<RequestBody>,
+    ) -> Result<(Response<Incoming>, Option<Pin<Box<Upstream>>>), Failure> {
+        let Self {
+            sent,
+            ended,
+            config,
+            deadline,
+        } = self;
+        let mut upstream = Some(connection);
+        let mut response = pin!(sender.try_send_request(request));
+        // Until the whole request body is sent, the only limit is the request
+        // deadline: an upload may take as long as it needs while it keeps
+        // moving, and the idle timeout in the body catches it when it stops.
+        // Once the body is sent, the response head timeout starts.
+        let head_by = || after(config.response_head_timeout).min(deadline);
+        let mut timer = pin!(sleep_until(if ended.is_some() {
+            head_by()
+        } else {
+            deadline
+        }));
+
+        // What each branch drops when another one wins:
+        // - `response` wins: nothing. The upstream connection moves into the
+        //   response body and goes on serving it.
+        // - `upstream` wins: the connection has finished, perhaps with an
+        //   error after handing over a response head, so the loop goes on
+        //   until `response` says which. Nothing is dropped.
+        // - `sent` wins: nothing is dropped; it only moves the timer.
+        // - `timer` wins: the request and the upstream connection are
+        //   dropped, which closes the socket to the upstream, and the client
+        //   gets 504 with `Connection: close`.
+        let response = loop {
+            tokio::select! {
+                biased;
+                result = &mut response => break result,
+                _ = poll_fn(|cx| upstream.as_mut().map_or(Poll::Pending, |c| c.as_mut().poll(cx))) => {
+                    upstream = None;
+                }
+                how = &mut *sent, if ended.is_none() => {
+                    // A body dropped without a word was not the client's fault.
+                    *ended = Some(how.unwrap_or(Sent::Complete));
+                    timer.as_mut().reset(head_by());
+                }
+                () = timer.as_mut() => return Err(Failure::Status(StatusCode::GATEWAY_TIMEOUT)),
             }
-            how = &mut sent, if ended.is_none() => {
-                // A body dropped without a word was not the client's fault.
-                ended = Some(how.unwrap_or(Sent::Complete));
-                timer.as_mut().reset(after(config.response_head_timeout).min(deadline));
-            }
-            () = timer.as_mut() => return Err(StatusCode::GATEWAY_TIMEOUT),
+        };
+        match response {
+            Ok(response) => Ok((response, upstream)),
+            Err(mut error) => Err(error.take_message().map_or(Failure::Broken, |request| {
+                Failure::Unsent(Box::new(request))
+            })),
         }
-    };
-    let Some(response) = response else {
-        // The body reports how it ended before it hands hyper an error, so
-        // when the client caused the failure, that is known by now.
-        return Err(match ended.or_else(|| sent.try_recv().ok()) {
-            Some(Sent::Idle) => StatusCode::REQUEST_TIMEOUT,
-            Some(Sent::Broken) => StatusCode::BAD_REQUEST,
-            Some(Sent::Deadline) => StatusCode::GATEWAY_TIMEOUT,
-            Some(Sent::Complete) | None => StatusCode::BAD_GATEWAY,
-        });
-    };
+    }
+}
 
-    let (mut head, body) = response.into_parts();
-    headers::prepare_response(&mut head)?;
-    let body = ResponseBody::Upstream {
-        body: Timed::new(body, config.idle_timeout, deadline),
-        connection: upstream,
-    };
-    Ok(Response::from_parts(head, body))
+/// A copy of a request head, for sending a request without a body again.
+fn copy_head(head: &request::Parts) -> request::Parts {
+    let mut copy = Request::new(()).into_parts().0;
+    copy.method = head.method.clone();
+    copy.uri = head.uri.clone();
+    copy.version = head.version;
+    copy.headers = head.headers.clone();
+    copy
 }
 
 /// The instant `timeout` from now, or a year from now for a timeout too

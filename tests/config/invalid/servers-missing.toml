@@ -1,0 +1,5 @@
+# line 2: missing field `servers`
+[upstreams.app]
+balance = "round_robin"
+[[routes]]
+upstream = "app"

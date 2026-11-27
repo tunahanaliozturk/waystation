@@ -1,0 +1,8 @@
+# line 3: is not a duration
+[pool]
+idle_timeout = "1h"
+
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]
+[[routes]]
+upstream = "app"

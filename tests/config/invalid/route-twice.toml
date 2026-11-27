@@ -1,0 +1,13 @@
+# line 11: already on line 5
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]
+
+[[routes]]
+host = "a.test"
+path = "/x"
+upstream = "app"
+
+[[routes]]
+host = "A.test"
+path = "/x"
+upstream = "app"

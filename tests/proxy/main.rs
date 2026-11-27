@@ -4,10 +4,16 @@
 // `cfg(test)` is always set here. It is written out so that clippy treats the
 // helpers in these modules as test code, where `unwrap` is allowed.
 #[cfg(test)]
+mod balancing;
+#[cfg(test)]
 mod disconnect;
 #[cfg(test)]
 mod faults;
 #[cfg(test)]
 mod forwarding;
+#[cfg(test)]
+mod pool;
+#[cfg(test)]
+mod routing;
 #[cfg(test)]
 mod support;

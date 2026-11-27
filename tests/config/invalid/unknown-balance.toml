@@ -1,0 +1,6 @@
+# line 3: unknown variant `random`
+[upstreams.app]
+balance = "random"
+servers = [{ address = "127.0.0.1:9001" }]
+[[routes]]
+upstream = "app"

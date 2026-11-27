@@ -1,0 +1,5 @@
+# line 3: not an IP address and port
+[upstreams.app]
+servers = [{ address = "127.0.0.1" }]
+[[routes]]
+upstream = "app"

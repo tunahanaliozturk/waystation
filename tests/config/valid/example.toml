@@ -1,0 +1,44 @@
+# A configuration that uses every setting. Each value shown is the default,
+# apart from the upstreams and routes, which have none.
+
+listen = "127.0.0.1:8080"
+
+[timeouts]
+connect = "5s"
+request_head = "10s"
+response_head = "30s"
+idle = "60s"
+request = "300s"
+
+[limits]
+max_header_bytes = 32768
+
+[pool]
+idle_timeout = "60s"
+max_idle_per_server = 64
+
+[upstreams.api]
+balance = "least_requests"
+servers = [
+  { address = "127.0.0.1:9001", weight = 3 },
+  { address = "127.0.0.1:9002" },
+]
+
+[upstreams.static]
+balance = "round_robin"
+servers = [{ address = "[::1]:9100" }]
+
+# Requests for api.example.test under /v1 go to the api group.
+[[routes]]
+host = "api.example.test"
+path = "/v1"
+upstream = "api"
+
+# Any other subdomain of example.test, and anything else at all, gets the
+# static group.
+[[routes]]
+host = "*.example.test"
+upstream = "static"
+
+[[routes]]
+upstream = "static"

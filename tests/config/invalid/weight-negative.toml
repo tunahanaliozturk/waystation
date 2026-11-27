@@ -1,0 +1,5 @@
+# line 3: invalid value
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001", weight = -3 }]
+[[routes]]
+upstream = "app"

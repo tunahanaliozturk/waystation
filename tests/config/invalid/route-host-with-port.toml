@@ -1,0 +1,7 @@
+# line 6: a route host has no port
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]
+
+[[routes]]
+host = "api.example.test:8080"
+upstream = "app"

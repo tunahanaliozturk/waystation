@@ -1,0 +1,6 @@
+# line 4: has no servers
+[upstreams.app]
+balance = "round_robin"
+servers = []
+[[routes]]
+upstream = "app"

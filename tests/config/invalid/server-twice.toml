@@ -1,0 +1,8 @@
+# line 5: listed twice
+[upstreams.app]
+servers = [
+  { address = "127.0.0.1:9001" },
+  { address = "127.0.0.1:9001", weight = 2 },
+]
+[[routes]]
+upstream = "app"

@@ -1,0 +1,3 @@
+# line 1: there are no [[routes]]
+[upstreams.app]
+servers = [{ address = "127.0.0.1:9001" }]

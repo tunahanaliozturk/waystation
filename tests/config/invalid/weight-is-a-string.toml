@@ -1,0 +1,7 @@
+# line 4: invalid type
+[upstreams.app]
+servers = [
+  { address = "127.0.0.1:9001", weight = "2" },
+]
+[[routes]]
+upstream = "app"
