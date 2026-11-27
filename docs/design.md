@@ -32,10 +32,46 @@ One process, one tokio multi-thread runtime. Whether a thread-per-core layout is
 
 ## Configuration
 
-One TOML file: listeners, routes, upstream groups, limits. Loading has two steps that never mix:
+One TOML file: the listen address, timeouts, limits, the connection pool, upstream groups and routes. Loading has two steps that never mix:
 
 1. Parse and validate the whole file into an immutable `Config`. Any error rejects the file; nothing is half applied.
 2. Swap the active `Arc<Config>` atomically.
+
+```toml
+listen = "127.0.0.1:8080"        # default 127.0.0.1:8080
+
+[timeouts]                       # each optional, defaults below
+connect = "5s"
+request_head = "10s"
+response_head = "30s"
+idle = "60s"
+request = "300s"
+
+[limits]
+max_header_bytes = 32768         # at least 1024
+
+[pool]
+idle_timeout = "60s"             # an idle upstream connection is closed after this
+max_idle_per_server = 64         # 0 turns connection reuse off
+
+[upstreams.api]
+balance = "least_requests"       # or "round_robin"; least_requests is the default
+servers = [
+  { address = "10.0.0.1:9000", weight = 3 },
+  { address = "10.0.0.2:9000" },  # weight 1
+]
+
+[[routes]]
+host = "api.example.test"        # or "*.example.test"; no host matches every host
+path = "/v1"                     # prefix, default "/"
+upstream = "api"
+```
+
+A duration is a whole number with `ms`, `s` or `m`, and above zero. A server address is an IP address and a port; host names wait for DNS support. Unknown keys are errors, so a misspelt key is not silently ignored.
+
+The file is checked as a whole: TOML syntax, types and ranges, server addresses, weights of at least 1, a server listed twice in a group, a group with no servers, route hosts (a name, an IP address or `*.` and a name, without a port), route paths (starting with `/`, with no query or fragment), a route to a group that does not exist, two routes for the same host and path, and a file with no routes. The first problem rejects the file with its line and column, for example `line 7, column 12: there is no upstream group `api``. Every rule has an example file under `tests/config/invalid/` that names the line it must be reported on, and `tests/config.rs` checks each.
+
+M2 reads the file once at start (`waystation --config FILE`); reloading arrives in M5.
 
 A request reads the active config once, when it arrives, and keeps that snapshot until it finishes. Connections opened under an old config finish under it.
 
@@ -49,9 +85,9 @@ Changes to upstream groups reuse existing pools when the address is unchanged, s
 2. TLS handshake with a timeout. Certificates are chosen by SNI.
 3. Read the request head, with limits on header count, header bytes and time to first byte.
 4. Reject ambiguous framing (see Security).
-5. Match a route: exact host, then wildcard host, then longest path prefix.
+5. Match a route: exact host, then wildcard host, then any host, and among the routes for that host the longest path prefix (ADR 0004). No match gets 404.
 6. Apply the rate limit for the route.
-7. Pick an upstream and send. The body is streamed in both directions; waystation never buffers a whole body.
+7. Pick a server of the route's group and send, on an idle connection to it if there is one. The body is streamed in both directions; waystation never buffers a whole body.
 8. Strip hop-by-hop headers both ways. Add `Forwarded` and `X-Forwarded-*`. Pass `traceparent` through unchanged.
 9. Record metrics and the access log line when the response ends or the client goes away.
 
@@ -70,10 +106,11 @@ Changes to upstream groups reuse existing pools when the address is unchanged, s
 | Status | When |
 | --- | --- |
 | 400 | Missing, repeated or malformed `Host`; framing two parsers could read differently (see Security); the client broke its request body off. |
+| 404 | No route matches the host and path. |
 | 408 | The client stopped sending its request body for longer than the idle timeout. |
 | 431 | The request head is larger than the limit. |
 | 501 | `CONNECT`; a request transfer coding other than `chunked` alone. |
-| 502 | The upstream refused the connection, closed it before a response head, or sent a head that is malformed, larger than the limit, or has a transfer coding other than `chunked` alone. |
+| 502 | The upstream refused the connection, closed it before a response head (after the one resend allowed on a reused connection, see Connection pool), or sent a head that is malformed, larger than the limit, or has a transfer coding other than `chunked` alone. |
 | 504 | The connection to the upstream or its response head took too long, or the request deadline passed before the head. |
 
 Every one of these closes the client connection after the response, because part of the request body may still be unread. Once the response head has gone to the client, a failure can only cut the response off: the connection is closed and the client never sees a complete body. A chunked response gets no last chunk, and a response with a length stops short of it.
@@ -84,14 +121,20 @@ Bodies are streams. A chunk is read from one side only when the other side can t
 
 ### Cancellation
 
-A client that disconnects cancels the upstream request. The upstream connection is returned to the pool only if the response was read to the end; otherwise it is closed. Every `select!` in the request path is reviewed for what is lost when the other branch wins, and that review is written next to the code.
+A client that disconnects cancels the upstream request. The upstream connection is returned to the pool only if the response was read to the end; otherwise it is closed. The deadline of the whole request is checked on every body chunk as well as by a timer, so a peer that always has the next chunk ready cannot run past it. Every `select!` in the request path is reviewed for what is lost when the other branch wins, and that review is written next to the code.
 
 ## Load balancing
 
-- Round robin.
-- Least requests with power of two choices: pick two upstreams at random, send to the one with fewer requests in flight. This is the default, because it avoids the herd behaviour of a full least-requests scan and needs no shared lock.
+- Round robin: smooth weighted round robin, as nginx does it, so weights 1, 2 and 5 give exactly 1, 2 and 5 of every eight requests, interleaved.
+- Least requests with power of two choices: draw two servers at random in proportion to their weights, send to the one with fewer requests in flight per unit of weight. This is the default, because it avoids the herd behaviour of a full least-requests scan and needs no shared lock.
 
-Weights are supported for both.
+Weights are whole numbers from 1 up, for both. How weights and load combine is in ADR 0005.
+
+## Connection pool
+
+Each server keeps its idle connections, most recently used first, up to `max_idle_per_server`, and closes one that has been idle for `idle_timeout`. A connection goes back only from a response read to its end, when hyper says it can take another request. An idle connection is not watched by a task; it is polled once, without a waker, when it is put back, when it is taken, and by a sweep from the accept loop once a second, which finds connections the upstream closed and bytes it sent unasked. Such a connection is closed, never used.
+
+A reused connection that fails before a response head gets the request once more, on a new connection to the same server, only when that cannot repeat it: hyper handed the request back unwritten, or the method is idempotent and the request has no body. Anything else gets 502. The rules and what they leave open are in ADR 0003.
 
 ## Health
 
@@ -116,7 +159,7 @@ The idle timer runs only while the proxy is waiting for a peer to send. While th
 
 The whole-request deadline still holds while the proxy waits for the client to take the response. hyper does not poll a response body it cannot write, so a timer in the body would never fire for a client that stops reading. The deadline is therefore also kept on the client connection itself: a write that is still blocked when it passes fails, hyper ends the connection, and the upstream connection is closed with it.
 
-A request is retried only when no byte of it reached an upstream, or when the method is idempotent and no byte of the response reached the client. Retries go to a different upstream. A retry budget per group caps retries at a share of recent requests, so a failing group does not get twice the load.
+A request is retried only when no byte of it reached an upstream, or when the method is idempotent and no byte of the response reached the client. Retries go to a different upstream. The one resend on a new connection after a reused connection fails (see Connection pool) is not such a retry: it goes to the same server and is not counted against the budget. A retry budget per group caps retries at a share of recent requests, so a failing group does not get twice the load.
 
 ## Rate limiting
 
@@ -164,3 +207,5 @@ No target numbers are claimed before they are measured. If waystation is slower,
 tokio, hyper, hyper-util, http-body-util, rustls with tokio-rustls, a TOML parser with serde, arc-swap. Versions are pinned when the first one is added, at the newest stable release. `cargo deny` checks licences and advisories in CI.
 
 In use as of M1: tokio, hyper, hyper-util (the tokio adapters for hyper) and http (for its authority parser; it is in the tree through hyper anyway). http-body-util was not needed: the two body types are written here. The tests add `cap`, a counting allocator, to measure the heap.
+
+Added in M2: `toml`, with only its parser and serde support, and `serde` with `derive`, for the configuration file. `toml` reports where each value sits in the file, which is what lets every error name its line. The random draws of the balancer use SplitMix64 written here, seeded from the standard library, rather than the `rand` crate.
