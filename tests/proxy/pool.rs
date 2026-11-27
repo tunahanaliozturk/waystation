@@ -55,6 +55,24 @@ async fn a_connection_the_upstream_closed_while_idle_is_not_used() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_idle_connection_the_upstream_closed_is_closed_by_the_sweep_long_before_its_timeout() {
+    // The pool idle timeout stays at its default of a minute, so only the
+    // sweep's poll can notice the upstream's end of stream.
+    let upstream = Upstream::start(Fault::HalfCloseWhenIdle(Duration::from_millis(100))).await;
+    let proxy = Proxy::start(Config::new(upstream.addr));
+
+    assert_eq!(exchange(proxy.addr, &get("/")).await.status, 200);
+    assert_eq!(upstream.open(), 1);
+
+    // The upstream closes its side after 100 ms and the sweep runs once a
+    // second, so this is at most about 1.2 s.
+    eventually(Duration::from_secs(5), "the proxy closed its end", || {
+        upstream.open() == 0
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_safe_request_on_a_connection_closed_under_it_is_sent_again_on_a_new_one() {
     let upstream = Upstream::start(Fault::AnswerFirstOnly).await;
     let proxy = Proxy::start(Config::new(upstream.addr));
@@ -73,10 +91,13 @@ async fn a_safe_request_on_a_connection_closed_under_it_is_sent_again_on_a_new_o
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unsafe_request_on_a_connection_closed_under_it_is_not_sent_twice() {
-    let requests: [&[u8]; 2] = [
+    let requests: [&[u8]; 3] = [
         // Nothing would stop this one from being sent again but its method.
         b"POST / HTTP/1.1\r\nhost: example.test\r\ncontent-length: 0\r\n\r\n",
         b"POST / HTTP/1.1\r\nhost: example.test\r\ncontent-length: 5\r\n\r\nhello",
+        // Idempotent, but its body is gone once sent, and a copy of its
+        // head would go out without it.
+        b"PUT / HTTP/1.1\r\nhost: example.test\r\ncontent-length: 5\r\n\r\nhello",
     ];
     for request in requests {
         let upstream = Upstream::start(Fault::AnswerFirstOnly).await;
@@ -88,12 +109,12 @@ async fn an_unsafe_request_on_a_connection_closed_under_it_is_not_sent_twice() {
         let reply = keep_alive_request(&mut client, request).await;
 
         assert_eq!(reply.status, 502, "{}", String::from_utf8_lossy(request));
-        let posts = upstream
+        let sent = upstream
             .heads()
             .iter()
-            .filter(|head| head.starts_with("POST "))
+            .filter(|head| !head.starts_with("GET "))
             .count();
-        assert_eq!(posts, 1, "{}", String::from_utf8_lossy(request));
+        assert_eq!(sent, 1, "{}", String::from_utf8_lossy(request));
     }
 }
 

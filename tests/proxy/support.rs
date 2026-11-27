@@ -91,6 +91,9 @@ pub(crate) enum Fault {
     ExtraBytes(Duration),
     /// Like `Echo`, but closes a connection that stays idle this long.
     CloseWhenIdle(Duration),
+    /// Like `CloseWhenIdle`, but closes only its sending side and keeps the
+    /// connection, and so `open`, until the proxy closes its end.
+    HalfCloseWhenIdle(Duration),
     /// Like `Echo` for the first request on each connection; any later one
     /// is read and the connection closed without an answer, as when the
     /// server closes an idle connection just as a request arrives.
@@ -106,6 +109,7 @@ impl Fault {
                 | Self::Download(_)
                 | Self::ExtraBytes(_)
                 | Self::CloseWhenIdle(_)
+                | Self::HalfCloseWhenIdle(_)
                 | Self::AnswerFirstOnly
         )
     }
@@ -200,6 +204,14 @@ async fn serve(mut stream: TcpStream, fault: Fault, state: &State) -> std::io::R
                 };
                 read
             }
+            Fault::HalfCloseWhenIdle(idle) if index > 0 => {
+                let Ok(read) = tokio::time::timeout(idle, next).await else {
+                    stream.shutdown().await?;
+                    while stream.read(&mut buf).await? > 0 {}
+                    return Ok(());
+                };
+                read
+            }
             _ => next.await,
         };
         let (head, rest) = match read {
@@ -254,7 +266,11 @@ async fn respond(
     state: &State,
 ) -> std::io::Result<()> {
     match fault {
-        Fault::Echo | Fault::CloseWhenIdle(_) | Fault::AnswerFirstOnly | Fault::ExtraBytes(_) => {
+        Fault::Echo
+        | Fault::CloseWhenIdle(_)
+        | Fault::HalfCloseWhenIdle(_)
+        | Fault::AnswerFirstOnly
+        | Fault::ExtraBytes(_) => {
             let body = format!("bytes={} pattern={}", check.len, check.verdict());
             stream
                 .write_all(ok_head(wide(body.len())).as_bytes())
