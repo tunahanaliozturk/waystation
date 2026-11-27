@@ -182,16 +182,16 @@ async fn forward(
         // Once only, and only from a reused connection: a new connection that
         // fails says something about the server, not about the pool.
         reuse = false;
-        request = match (failure, &copy) {
-            (Failure::Unsent(unsent), _) if reused => *unsent,
-            (Failure::Broken, Some(copy)) if reused => {
+        request = match again(failure, reused, copy.as_ref()) {
+            Ok(Again::Unsent(unsent)) => *unsent,
+            Ok(Again::Copy(copy)) => {
                 let (body, receiver) = RequestBody::new(None);
                 sent = receiver;
                 ended = None;
                 Request::from_parts(copy_head(copy), body)
             }
-            (Failure::Status(status), _) => return Err(status),
-            (Failure::Unsent(_) | Failure::Broken, _) => {
+            Err(Failure::Status(status)) => return Err(status),
+            Err(Failure::Unsent(_) | Failure::Broken) => {
                 // The body reports how it ended before it hands hyper an
                 // error, so when the client caused the failure, that is known
                 // by now.
@@ -214,6 +214,30 @@ enum Failure {
     Broken,
     /// A timeout ran out; the status says which.
     Status(StatusCode),
+}
+
+/// What goes out once more after a failed attempt.
+enum Again<'a> {
+    /// The request hyper gave back unwritten, whatever its method.
+    Unsent(Box<Request<RequestBody>>),
+    /// A request rebuilt from this copy of its head.
+    Copy(&'a request::Parts),
+}
+
+/// Whether a request that failed with `failure` is sent once more, and
+/// what is sent (ADR 0003). Only a failure on a reused connection is tried
+/// again; `copy` is there only for an idempotent request without a body.
+/// `Err` hands the failure back to be answered.
+fn again(
+    failure: Failure,
+    reused: bool,
+    copy: Option<&request::Parts>,
+) -> Result<Again<'_>, Failure> {
+    match (failure, copy) {
+        (Failure::Unsent(unsent), _) if reused => Ok(Again::Unsent(unsent)),
+        (Failure::Broken, Some(copy)) if reused => Ok(Again::Copy(copy)),
+        (failure, _) => Err(failure),
+    }
 }
 
 /// Opens a new connection to `addr`.
@@ -326,4 +350,55 @@ fn after(timeout: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(timeout)
         .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unsent() -> Failure {
+        Failure::Unsent(Box::new(Request::new(RequestBody::new(None).0)))
+    }
+
+    fn head() -> request::Parts {
+        Request::new(()).into_parts().0
+    }
+
+    // The race these cover, a close that arrives after the pool's check and
+    // before hyper writes, cannot be produced on purpose end to end.
+    #[test]
+    fn a_request_hyper_never_wrote_goes_again_from_a_reused_connection_whatever_its_method() {
+        assert!(matches!(again(unsent(), true, None), Ok(Again::Unsent(_))));
+        assert!(matches!(
+            again(unsent(), false, None),
+            Err(Failure::Unsent(_))
+        ));
+    }
+
+    #[test]
+    fn a_broken_request_goes_again_only_with_a_copy_and_from_a_reused_connection() {
+        let copy = head();
+        assert!(matches!(
+            again(Failure::Broken, true, Some(&copy)),
+            Ok(Again::Copy(_))
+        ));
+        assert!(matches!(
+            again(Failure::Broken, true, None),
+            Err(Failure::Broken)
+        ));
+        assert!(matches!(
+            again(Failure::Broken, false, Some(&copy)),
+            Err(Failure::Broken)
+        ));
+    }
+
+    #[test]
+    fn a_timeout_never_goes_again() {
+        let copy = head();
+        let timeout = || Failure::Status(StatusCode::GATEWAY_TIMEOUT);
+        assert!(matches!(
+            again(timeout(), true, Some(&copy)),
+            Err(Failure::Status(_))
+        ));
+    }
 }
